@@ -16,11 +16,13 @@ class ChaserCalculator(Node):
         self.carrot_frame = 'enemy_bot/target_point'
         self.broadcast_frame = 'chase_nav_target'
 
-        # TUNING POINT: How far ahead along the line-of-sight the intermediate goal is placed.
-        # Reduce to 0.5m for tighter turning, increase to 1.2m for faster, smoother straight lines.
+        # TUNING POINT: Intermediate goal projection horizon
         self.short_goal_dist = 0.8
+        self.capture_orientation_dist = 0.35
+
         self.current_state = 'CHASING'
         self.costmap = None
+        self.last_valid_yaw = 0.0
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
@@ -29,9 +31,8 @@ class ChaserCalculator(Node):
         self.create_subscription(String, 'our_bot/robot_state', self.state_cb, 10)
         self.create_subscription(OccupancyGrid, '/our_bot/global_costmap/costmap', self.costmap_cb, 10)
 
-        # TUNING POINT: 10 Hz (0.1s) is usually fine, but if tracking fast bots, you can push this to 0.05 (20 Hz).
         self.timer = self.create_timer(0.1, self.control_loop)
-        self.get_logger().info("Chaser Calculator initialized. Ready for future attack logic.")
+        self.get_logger().info("Chaser Calculator initialized. Safe linear retraction active.")
 
     def state_cb(self, msg):
         self.current_state = msg.data
@@ -39,26 +40,36 @@ class ChaserCalculator(Node):
     def costmap_cb(self, msg: OccupancyGrid):
         self.costmap = msg
 
-    def is_pose_safe(self, x: float, y: float) -> bool:
+    def is_pose_safe(self, x: float, y: float, max_cost: int = 50) -> bool:
         if self.costmap is None: return True
         info = self.costmap.info
         gx = int((x - info.origin.position.x) / info.resolution)
         gy = int((y - info.origin.position.y) / info.resolution)
-        if 0 <= gx < info.width and 0 <= gy < info.height:
-            # TUNING POINT: OccupancyGrid values range 0 to 100 (100 = obstacle, -1 = unknown).
-            # Threshold < 50 represents safe, low-cost navigable space.
-            cost = self.costmap.data[gy * info.width + gx]
-            return 0 <= cost < 50
-        return False
+
+        # MAP BOUNDARY GUARD: Enforce a 15-cell margin (0.75m) from map edges
+        MARGIN = 15
+        if gx < MARGIN or gx >= (info.width - MARGIN) or \
+           gy < MARGIN or gy >= (info.height - MARGIN):
+            return False
+
+        cost = self.costmap.data[gy * info.width + gx]
+        return 0 <= cost < max_cost
 
     def project_to_free_space(self, start_x: float, start_y: float, target_x: float, target_y: float):
-        if self.is_pose_safe(target_x, target_y): return target_x, target_y
-        if math.hypot(target_x - start_x, target_y - start_y) < 0.05: return start_x, start_y
-        for i in range(1, 10):
-            alpha = 1.0 - (i / 10.0)
+        # Linear Retraction: Pull target back towards pursuer along line-of-sight vector until safe
+        if self.is_pose_safe(target_x, target_y, max_cost=50):
+            return target_x, target_y
+
+        dist = math.hypot(target_x - start_x, target_y - start_y)
+        if dist < 0.05: return start_x, start_y
+
+        for i in range(1, 20):
+            alpha = 1.0 - (i / 20.0)
             px = start_x + alpha * (target_x - start_x)
             py = start_y + alpha * (target_y - start_y)
-            if self.is_pose_safe(px, py): return px, py
+            if self.is_pose_safe(px, py, max_cost=50):
+                return px, py
+
         return start_x, start_y
 
     def control_loop(self):
@@ -79,19 +90,27 @@ class ChaserCalculator(Node):
         dy = c_y - p_y
         dist = math.hypot(dx, dy)
 
-        if dist > self.short_goal_dist:
-            ratio = self.short_goal_dist / dist
+        # Dynamic goal lead distance
+        lead_dist = min(self.short_goal_dist, max(0.4, dist * 0.7))
+
+        if dist > lead_dist:
+            ratio = lead_dist / dist
             target_x = p_x + dx * ratio
             target_y = p_y + dy * ratio
-            # Heading along movement direction to prevent rotation wobble during intermediate approach
-            move_yaw = math.atan2(dy, dx)
-            rot_z = math.sin(move_yaw / 2.0)
-            rot_w = math.cos(move_yaw / 2.0)
         else:
             target_x = c_x
             target_y = c_y
+
+        # Prevent 180-degree move_yaw flips on micro-overshoots
+        if dist > 0.15:
+            self.last_valid_yaw = math.atan2(dy, dx)
+
+        if dist <= self.capture_orientation_dist:
             rot_z = c_rot.z
             rot_w = c_rot.w
+        else:
+            rot_z = math.sin(self.last_valid_yaw / 2.0)
+            rot_w = math.cos(self.last_valid_yaw / 2.0)
 
         safe_x, safe_y = self.project_to_free_space(p_x, p_y, target_x, target_y)
 
