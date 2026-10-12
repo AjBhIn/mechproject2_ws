@@ -55,12 +55,21 @@ class GoalSender(Node):
         except tf2_ros.TransformException:
             return None
 
+    def get_yaw_from_quaternion(self, q):
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        return math.atan2(siny_cosp, cosy_cosp)
+
     def goal_response_callback(self, future):
         self.is_goal_pending = False
-        goal_handle = future.result()
-        if goal_handle.accepted:
-            self.active_goal_handle = goal_handle
-        else:
+        try:
+            goal_handle = future.result()
+            if goal_handle.accepted:
+                self.active_goal_handle = goal_handle
+            else:
+                self.active_goal_handle = None
+        except Exception as e:
+            self.get_logger().warn(f"Goal dispatch exception: {e}")
             self.active_goal_handle = None
 
     def control_loop(self):
@@ -69,8 +78,13 @@ class GoalSender(Node):
 
         now_sec = self.get_clock().now().nanoseconds / 1e9
 
-        # GUARD: Prevent action client deadlock if goal callback drops or hangs
-        if self.is_goal_pending:
+        # ENHANCEMENT 1: State Change Override
+        # If a state change occurs, override pending status to force immediate goal dispatch
+        if self.force_update:
+            self.is_goal_pending = False
+
+        # ENHANCEMENT 2: Deadlock Guard Timeout (0.5s timeout for pending action responses)
+        if self.is_goal_pending: 
             if (now_sec - self.last_goal_time) > 0.5:
                 self.get_logger().warn("Goal response timed out (>0.5s). Resetting pending flag.")
                 self.is_goal_pending = False
@@ -83,6 +97,7 @@ class GoalSender(Node):
 
         t_x = target_tf.transform.translation.x
         t_y = target_tf.transform.translation.y
+        t_rot = target_tf.transform.rotation
 
         # Get the robot's current position in the map frame to compute distance to target
         try:
@@ -91,13 +106,13 @@ class GoalSender(Node):
         except tf2_ros.TransformException:
             dist_to_target = 2.0
 
-        # Dynamic spacing adjustment (smooth preemption pacing)
-        if dist_to_target < 1.0:
+        # ENHANCEMENT 3: Optimized pacing thresholds (smooth execution without DWB starvation)
+        if dist_to_target < 1.2:
             dynamic_min_dist = 0.15   
-            dynamic_min_time = 0.35   
+            dynamic_min_time = 0.30   
         else:
-            dynamic_min_dist = 0.40   
-            dynamic_min_time = 0.60   
+            dynamic_min_dist = 0.35   
+            dynamic_min_time = 0.50   
 
         # Only apply pacing limits if we aren't being forced to update by a state change
         if not self.force_update:
@@ -107,7 +122,12 @@ class GoalSender(Node):
                 dist_moved = math.hypot(dx, dy)
                 time_elapsed = now_sec - self.last_goal_time
 
-                if dist_moved < dynamic_min_dist or time_elapsed < dynamic_min_time:
+                # ENHANCEMENT 4: Orientation Delta Check (trigger update if target rotates > 15 deg)
+                yaw_current = self.get_yaw_from_quaternion(t_rot)
+                yaw_last = self.get_yaw_from_quaternion(self.last_sent_pose.pose.orientation)
+                yaw_change = abs(math.atan2(math.sin(yaw_current - yaw_last), math.cos(yaw_current - yaw_last)))
+
+                if dist_moved < dynamic_min_dist and yaw_change < math.radians(15.0) and time_elapsed < dynamic_min_time:
                     return
 
         # Reset flag and commit to sending goal
@@ -118,7 +138,7 @@ class GoalSender(Node):
         goal.header.stamp = self.get_clock().now().to_msg()
         goal.pose.position.x = t_x
         goal.pose.position.y = t_y
-        goal.pose.orientation = target_tf.transform.rotation
+        goal.pose.orientation = t_rot
 
         goal_msg = NavigateToPose.Goal()
         goal_msg.pose = goal
