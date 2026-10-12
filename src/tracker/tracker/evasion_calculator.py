@@ -54,7 +54,7 @@ class EvasionCalculator(Node):
         # Active target lock to maintain path commitment and stop zigzagging
         self.active_target_x = None
         self.active_target_y = None
-        self.slide_direction_bias = None  # Persistent slide bias ('LEFT' or 'RIGHT') when wall/pillar sliding
+        self.slide_direction_bias = None  # Persistent slide bias (+1 or -1) when wall-sliding
 
         # The runner!
         self.timer = self.create_timer(0.1, self.control_loop)
@@ -90,7 +90,7 @@ class EvasionCalculator(Node):
 
         # VIRTUAL BOUNDARY PADDING: 
         # Treat the outer 15 cells (0.75 meters at 0.05m res) as solid walls
-        MARGIN = 20
+        MARGIN = 15
         if raw_col < MARGIN or raw_col >= (self.map_width - MARGIN) or \
            raw_row < MARGIN or raw_row >= (self.map_height - MARGIN):
             return 100
@@ -117,7 +117,7 @@ class EvasionCalculator(Node):
         raw_cols = ((px - self.map_origin_x) / self.map_res).astype(np.int32)
         raw_rows = ((py - self.map_origin_y) / self.map_res).astype(np.int32)
 
-        MARGIN = 10
+        MARGIN = 15
         if np.any(raw_cols < MARGIN) or np.any(raw_cols >= (self.map_width - MARGIN)) or \
            np.any(raw_rows < MARGIN) or np.any(raw_rows >= (self.map_height - MARGIN)):
             return False
@@ -132,30 +132,22 @@ class EvasionCalculator(Node):
         return True
 
     def check_path_feasibility(self, start_x, start_y, end_x, end_y):
-        # 1. Straight path check (Fastest & Strongly Preferred)
         if self.is_path_clear(start_x, start_y, end_x, end_y):
             return True, 'STRAIGHT'
             
-        # 2. Tangential Circumvention (Swinging wide around pillars / obstacles)
         direct_angle = math.atan2(end_y - start_y, end_x - start_x)
         total_dist = math.hypot(end_x - start_x, end_y - start_y)
         mid_dist = total_dist / 2.0
         
-        # Test 45-deg and 60-deg arcs to push waypoints outside pillar inflation rings
-        test_angles = [
-            math.radians(45), math.radians(-45),
-            math.radians(60), math.radians(-60)
-        ]
+        test_angles = [math.radians(45), math.radians(-45)]
         
         for offset in test_angles:
             mid_x = start_x + (mid_dist * math.cos(direct_angle + offset))
             mid_y = start_y + (mid_dist * math.sin(direct_angle + offset))
 
-            # ENHANCEMENT: Midpoint MUST lie in clean open space (cost < 15) outside the cyan inflation ring
-            if self.get_cell_cost(mid_x, mid_y) < 15:
-                if self.is_path_clear(start_x, start_y, mid_x, mid_y):
-                    if self.is_path_clear(mid_x, mid_y, end_x, end_y):
-                        return True, 'CIRCUMVENT'
+            if self.is_path_clear(start_x, start_y, mid_x, mid_y):
+                if self.is_path_clear(mid_x, mid_y, end_x, end_y):
+                    return True, 'DOGLEG'
                     
         return False, 'NONE'
 
@@ -192,16 +184,12 @@ class EvasionCalculator(Node):
         away_dy = our_y - enemy_y
         away_angle = math.atan2(away_dy, away_dx)
 
-        # Baseline distances along X and Y axes
-        curr_dx = abs(our_x - enemy_x)
-        curr_dy = abs(our_y - enemy_y)
-
-        # Check if the direct 'away' path leads into a wall or pillar inflation (cost > 20 within 1.0m)
+        # Check if the direct 'away' path leads into a wall (inflation > 20 within 1.0m)
         direct_away_x = our_x + 1.0 * math.cos(away_angle)
         direct_away_y = our_y + 1.0 * math.sin(away_angle)
         direct_away_blocked = self.get_cell_cost(direct_away_x, direct_away_y) > 20
 
-        # Tangential Vectors (slide left or right around obstacle)
+        # Calculate Tangential Vectors (slide left or slide right along the wall)
         tangent_left = away_angle + (math.pi / 2.0)
         tangent_right = away_angle - (math.pi / 2.0)
 
@@ -211,55 +199,41 @@ class EvasionCalculator(Node):
 
             cand_angle = math.atan2(cand_y - our_y, cand_x - our_x)
 
-            # 1. TANGENTIAL DEFLECTION: If direct path away hits an obstacle or pillar, reward arc sliding
+            # 1. TANGENTIAL DEFLECTION: If direct path away is blocked by a wall, reward sliding parallel to wall
             if direct_away_blocked:
                 diff_left = abs(math.atan2(math.sin(cand_angle - tangent_left), math.cos(cand_angle - tangent_left)))
                 diff_right = abs(math.atan2(math.sin(cand_angle - tangent_right), math.cos(cand_angle - tangent_right)))
                 
+                # Favor tangential sliding score
                 slide_score = (math.pi - min(diff_left, diff_right)) * 12.0
                 score += slide_score
 
-                # Maintain slide direction hysteresis (+20.0) to prevent left-right oscillation
+                # Maintain slide direction hysteresis (+20.0) to stop left-right zigzagging along the wall
                 if self.slide_direction_bias == 'LEFT' and diff_left < diff_right:
                     score += 20.0
                 elif self.slide_direction_bias == 'RIGHT' and diff_right < diff_left:
                     score += 20.0
             else:
+                # Direct away path is open—reward moving straight away
                 angle_diff_away = abs(math.atan2(math.sin(cand_angle - away_angle), math.cos(cand_angle - away_angle)))
                 score += (math.pi - angle_diff_away) * 10.0
 
-            # 2. COMPONENT-WISE DISTANCE CHECK (Soft X/Y convergence penalty)
-            cand_dx = abs(cand_x - enemy_x)
-            cand_dy = abs(cand_y - enemy_y)
-            approaching_x = cand_dx < curr_dx
-            approaching_y = cand_dy < curr_dy
-
-            if approaching_x and approaching_y:
-                score -= 30.0  # Penalize closing in on enemy along both axes
-            elif approaching_x or approaching_y:
-                score -= 8.0   # Minor penalty for closing in along one axis
-            else:
-                score += 12.0  # Reward opening distance on both axes
-
-            # 3. INFLATION SLOPE PENALTY: Severely penalize moving deeper into obstacle inflation
+            # 2. INFLATION SLOPE PENALTY: Severely penalize moving deeper into wall inflation!
             cost_increase = cost - current_cost
             if cost_increase > 0:
-                score -= cost_increase * 3.5
+                score -= cost_increase * 3.5  # Heavy penalty for heading towards higher cost/walls
 
             turn_penalty = abs(math.atan2(math.sin(cand_angle - our_yaw), math.cos(cand_angle - our_yaw)))
             score -= turn_penalty * weights['w_turn']
             score -= cost * weights['w_cost']
 
-            # Path Preference: Straight paths preferred (+18.0), clean circumvention arcing preferred over inflation hugging (+12.0)
             if path_type == 'STRAIGHT':
-                score += 18.0
-            elif path_type == 'CIRCUMVENT':
-                score += 12.0
+                score += 15.0
 
             if 0 <= cost < 10: 
                 score += 10.0
 
-            # Active target hysteresis (+25.0) locks the target point to stop DWB jitter
+            # Active target hysteresis (+25.0) locks the target point so DWB doesn't wobble
             if self.active_target_x is not None and self.active_target_y is not None:
                 if math.hypot(cand_x - self.active_target_x, cand_y - self.active_target_y) < 0.4:
                     score += 25.0
@@ -271,6 +245,7 @@ class EvasionCalculator(Node):
         if best_point is not None:
             self.active_target_x, self.active_target_y = best_point[0], best_point[1]
             
+            # Remember whether we are sliding left or right to keep momentum smooth
             cand_angle = best_point[2]
             diff_left = abs(math.atan2(math.sin(cand_angle - tangent_left), math.cos(cand_angle - tangent_left)))
             diff_right = abs(math.atan2(math.sin(cand_angle - tangent_right), math.cos(cand_angle - tangent_right)))

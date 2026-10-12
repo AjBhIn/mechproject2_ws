@@ -13,6 +13,7 @@ class ChaserCalculator(Node):
 
         self.map_frame = 'map'
         self.pursuer_frame = 'our_bot/base_link'
+        self.enemy_frame = 'enemy_bot/base_link'
         self.carrot_frame = 'enemy_bot/target_point'
         self.broadcast_frame = 'chase_nav_target'
 
@@ -24,6 +25,15 @@ class ChaserCalculator(Node):
         self.costmap = None
         self.last_valid_yaw = 0.0
 
+        # ENHANCEMENT: Enemy heading and rotation tracking to prevent charging into front spins
+        self.last_enemy_yaw = None
+        self.last_enemy_time = None
+        self.enemy_yaw_rate = 0.0
+
+        # ENHANCEMENT: Target TF smoothing to prevent target teleportation on 180-deg spins
+        self.filtered_target_x = None
+        self.filtered_target_y = None
+
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
@@ -32,13 +42,18 @@ class ChaserCalculator(Node):
         self.create_subscription(OccupancyGrid, '/our_bot/global_costmap/costmap', self.costmap_cb, 10)
 
         self.timer = self.create_timer(0.1, self.control_loop)
-        self.get_logger().info("Chaser Calculator initialized. Safe linear retraction active.")
+        self.get_logger().info("Smart Chaser Calculator initialized (Flank Routing & Spin Guard Active).")
 
     def state_cb(self, msg):
         self.current_state = msg.data
 
     def costmap_cb(self, msg: OccupancyGrid):
         self.costmap = msg
+
+    def get_yaw_from_quaternion(self, q):
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        return math.atan2(siny_cosp, cosy_cosp)
 
     def is_pose_safe(self, x: float, y: float, max_cost: int = 50) -> bool:
         if self.costmap is None: return True
@@ -56,7 +71,6 @@ class ChaserCalculator(Node):
         return 0 <= cost < max_cost
 
     def project_to_free_space(self, start_x: float, start_y: float, target_x: float, target_y: float):
-        # Linear Retraction: Pull target back towards pursuer along line-of-sight vector until safe
         if self.is_pose_safe(target_x, target_y, max_cost=50):
             return target_x, target_y
 
@@ -72,13 +86,25 @@ class ChaserCalculator(Node):
 
         return start_x, start_y
 
+    def update_enemy_yaw_rate(self, enemy_yaw: float, current_time: float):
+        if self.last_enemy_yaw is not None and self.last_enemy_time is not None:
+            dt = current_time - self.last_enemy_time
+            if 0.01 < dt < 1.0:
+                raw_rate = abs(math.atan2(math.sin(enemy_yaw - self.last_enemy_yaw), math.cos(enemy_yaw - self.last_enemy_yaw))) / dt
+                self.enemy_yaw_rate = 0.6 * self.enemy_yaw_rate + 0.4 * raw_rate
+        self.last_enemy_yaw = enemy_yaw
+        self.last_enemy_time = current_time
+
     def control_loop(self):
         if self.current_state != 'CHASING':
+            self.filtered_target_x = None
+            self.filtered_target_y = None
             return
 
         try:
             t_our = self.tf_buffer.lookup_transform(self.map_frame, self.pursuer_frame, rclpy.time.Time())
             t_carrot = self.tf_buffer.lookup_transform(self.map_frame, self.carrot_frame, rclpy.time.Time())
+            t_enemy = self.tf_buffer.lookup_transform(self.map_frame, self.enemy_frame, rclpy.time.Time())
         except tf2_ros.TransformException:
             return
 
@@ -86,20 +112,45 @@ class ChaserCalculator(Node):
         c_x, c_y = t_carrot.transform.translation.x, t_carrot.transform.translation.y
         c_rot = t_carrot.transform.rotation
 
-        dx = c_x - p_x
-        dy = c_y - p_y
+        e_x, e_y = t_enemy.transform.translation.x, t_enemy.transform.translation.y
+        enemy_yaw = self.get_yaw_from_quaternion(t_enemy.transform.rotation)
+
+        now_sec = self.get_clock().now().nanoseconds / 1e9
+        self.update_enemy_yaw_rate(enemy_yaw, now_sec)
+
+        # ENHANCEMENT 1: Filter target TF movements on sharp enemy turns to stop target teleportation
+        if self.filtered_target_x is None:
+            self.filtered_target_x, self.filtered_target_y = c_x, c_y
+        else:
+            alpha = 0.4 if self.enemy_yaw_rate > 1.0 else 0.8  # Smooth target jumping when enemy spins fast
+            self.filtered_target_x = alpha * c_x + (1.0 - alpha) * self.filtered_target_x
+            self.filtered_target_y = alpha * c_y + (1.0 - alpha) * self.filtered_target_y
+
+        dx = self.filtered_target_x - p_x
+        dy = self.filtered_target_y - p_y
         dist = math.hypot(dx, dy)
 
-        # Dynamic goal lead distance
-        lead_dist = min(self.short_goal_dist, max(0.4, dist * 0.7))
+        # ENHANCEMENT 2: Anti-Ramming Flank Routing
+        # Check if straight pursuit path cuts through enemy's front nose cone
+        angle_to_pursuer_from_enemy = math.atan2(p_y - e_y, p_x - e_x)
+        front_cone_diff = abs(math.atan2(math.sin(angle_to_pursuer_from_enemy - enemy_yaw), math.cos(angle_to_pursuer_from_enemy - enemy_yaw)))
 
-        if dist > lead_dist:
-            ratio = lead_dist / dist
-            target_x = p_x + dx * ratio
-            target_y = p_y + dy * ratio
+        # If enemy turned to face us (< 60 deg) and is close (< 1.8m), deflect carrot point sideways to flank!
+        if front_cone_diff < math.radians(60.0) and dist < 1.8:
+            flank_side = (angle_to_pursuer_from_enemy - enemy_yaw) > 0
+            flank_offset_angle = enemy_yaw + (math.pi / 2.0 if flank_side else -math.pi / 2.0)
+            target_x = e_x + 1.0 * math.cos(flank_offset_angle)
+            target_y = e_y + 1.0 * math.sin(flank_offset_angle)
         else:
-            target_x = c_x
-            target_y = c_y
+            # Standard linear lead pursuit
+            lead_dist = min(self.short_goal_dist, max(0.4, dist * 0.7))
+            if dist > lead_dist:
+                ratio = lead_dist / dist
+                target_x = p_x + dx * ratio
+                target_y = p_y + dy * ratio
+            else:
+                target_x = self.filtered_target_x
+                target_y = self.filtered_target_y
 
         # Prevent 180-degree move_yaw flips on micro-overshoots
         if dist > 0.15:

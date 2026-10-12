@@ -109,10 +109,10 @@ class GoalSender(Node):
         # ENHANCEMENT 3: Optimized pacing thresholds (smooth execution without DWB starvation)
         if dist_to_target < 1.2:
             dynamic_min_dist = 0.15   
-            dynamic_min_time = 0.30   
+            dynamic_min_time = 0.40   
         else:
             dynamic_min_dist = 0.35   
-            dynamic_min_time = 0.50   
+            dynamic_min_time = 0.60   
 
         # Only apply pacing limits if we aren't being forced to update by a state change
         if not self.force_update:
