@@ -90,7 +90,7 @@ class EvasionCalculator(Node):
 
         # VIRTUAL BOUNDARY PADDING: 
         # Treat the outer 15 cells (0.75 meters at 0.05m res) as solid walls
-        MARGIN = 15
+        MARGIN = 20
         if raw_col < MARGIN or raw_col >= (self.map_width - MARGIN) or \
            raw_row < MARGIN or raw_row >= (self.map_height - MARGIN):
             return 100
