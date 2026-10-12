@@ -1,0 +1,52 @@
+our_bot/amcl:
+  ros__parameters:
+    use_sim_time: true
+    
+    # Explicit Frames
+    base_frame_id: "our_bot/base_link"
+    odom_frame_id: "our_bot/odom"
+    global_frame_id: "map"
+    map_topic: "/map"
+    scan_topic: "/our_bot/scan"
+    
+    # Particle Filter Controls
+    min_particles: 1000
+    max_particles: 4000
+    pf_err: 0.05
+    pf_z: 0.99
+    resample_interval: 1
+    
+    # Motion Model & Trigger Thresholds
+    update_min_d: 0.1
+    update_min_a: 0.1
+    robot_model_type: "nav2_amcl::DifferentialMotionModel"
+    
+    # Odometry Noise
+    alpha1: 0.05
+    alpha2: 0.05
+    alpha3: 0.05
+    alpha4: 0.05
+    alpha5: 0.05
+    
+    # Laser Sensor Model
+    laser_model_type: "likelihood_field"
+    max_beams: 60
+    laser_likelihood_max_dist: 2.0
+    laser_min_range: -1.0
+    laser_max_range: 100.0
+    z_hit: 0.85
+    z_short: 0.05
+    z_max: 0.05
+    z_rand: 0.05
+    sigma_hit: 0.2
+    
+    # Initial Pose
+    tf_broadcast: true
+    transform_tolerance: 1.0
+    save_pose_rate: 0.5
+    set_initial_pose: true
+    initial_pose:
+      x: -2.0
+      y: 0.0
+      z: 0.0
+      yaw: 0.0

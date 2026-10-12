@@ -1,0 +1,12 @@
+# ROS files
+build/
+log/
+.colcon/
+install/
+
+
+# python files
+**/__pycache__/
+*.pyc 
+.vscode/
+EOF

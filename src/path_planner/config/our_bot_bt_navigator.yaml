@@ -1,0 +1,21 @@
+# LIFECYCLE/NAMESPACE: Scoped node name for /our_bot namespace
+our_bot/bt_navigator:
+  ros__parameters:
+    # TIME: Synchronizes behavior tree navigator with simulation clock
+    use_sim_time: True
+    global_frame: map
+    robot_base_frame: our_bot/base_link
+    # CONNECTION: Binds BT navigator pose monitoring to our_bot odometry topic
+    odom_topic: /our_bot/odom
+    bt_loop_duration: 10
+    default_server_timeout: 20
+    # LIFECYCLE/CONNECTION: Timeout in ms when waiting for planner/controller action servers during startup
+    wait_for_service_timeout: 1000
+    action_server_result_timeout: 900.0
+    navigators: ["navigate_to_pose", "navigate_through_poses"]
+    navigate_to_pose:
+      plugin: "nav2_bt_navigator::NavigateToPoseNavigator"
+      search_window: 4.0
+    navigate_through_poses:
+      plugin: "nav2_bt_navigator::NavigateThroughPosesNavigator"
+      search_window: 4.0
