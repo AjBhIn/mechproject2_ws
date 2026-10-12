@@ -19,7 +19,6 @@ class EvasionCalculator(Node):
         self.enemy_frame = 'enemy_bot/base_link'
         self.target_frame = 'dynamic_nav_target'
         
-        
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
@@ -30,13 +29,12 @@ class EvasionCalculator(Node):
         self.costmap_sub = self.create_subscription(OccupancyGrid, '/our_bot/global_costmap/costmap', self.costmap_callback, 10)
 
         # TUNING POINT: Distances (meters) to search for safe escape points.
-        # If your physical bot is fast, you might want to extend this to [1.0, 1.5, 2.0, 2.5].
-        self.sample_radii = [0.8, 1.2, 1.8, 2.0]
+        self.sample_radii = [0.6, 1.0, 1.5, 2.0]
         
-        # TUNING POINT: Search angle resolution. 8 degrees is fine, but if CPU is high on the real bot, change to 12 or 15.
-        self.angle_steps = [(math.cos(math.radians(deg)), math.sin(math.radians(deg))) for deg in range(0, 360, 8)]
+        # TUNING POINT: Search angle resolution. 10 degrees (36 steps) balances coverage and CPU speed.
+        self.angle_steps = [(math.cos(math.radians(deg)), math.sin(math.radians(deg))) for deg in range(0, 360, 10)]
 
-        self.map_data =  None
+        self.map_data = None
         self.map_res = 0.05
         self.map_width = 0
         self.map_height = 0
@@ -44,7 +42,7 @@ class EvasionCalculator(Node):
         self.map_origin_y = 0.0
         
         # TUNING POINT: Cost threshold for evasion paths (OccupancyGrid scale 0-100).
-        self.MAX_SAFE_COST = 50
+        self.MAX_SAFE_COST = 40
 
         self.last_target_x, self.last_target_y = None, None
         
@@ -53,6 +51,10 @@ class EvasionCalculator(Node):
         self.memory_bank: List[Tuple[float, float, float]] = []
         self.memory_space = 5
 
+        # Active target lock to maintain path commitment and stop zigzagging
+        self.active_target_x = None
+        self.active_target_y = None
+        self.slide_direction_bias = None  # Persistent slide bias ('LEFT' or 'RIGHT') when wall/pillar sliding
 
         # The runner!
         self.timer = self.create_timer(0.1, self.control_loop)
@@ -88,7 +90,6 @@ class EvasionCalculator(Node):
 
         # VIRTUAL BOUNDARY PADDING: 
         # Treat the outer 15 cells (0.75 meters at 0.05m res) as solid walls
-        # This prevents target TFs from ever landing near the edge of the map
         MARGIN = 15
         if raw_col < MARGIN or raw_col >= (self.map_width - MARGIN) or \
            raw_row < MARGIN or raw_row >= (self.map_height - MARGIN):
@@ -104,121 +105,67 @@ class EvasionCalculator(Node):
     def is_path_clear(self, start_x: float, start_y: float, end_x: float, end_y: float) -> bool:
 
         if self.map_data is None: return False
-        # Getting the distance between the our bot and the select pose
         dist = math.hypot(end_x - start_x, end_y - start_y)
 
-        # Dynamic step size based on the distance
         step_size = 0.10 if dist <= 0.8 else 0.05
-        # Find the number of mini goals / steps needed
         steps = max(2, int(dist / step_size))
 
-        # Create those mini goals in the range of 0.0 to 1.0 and then scale them to the actual path
         t = np.linspace(0.0, 1.0, steps)
-        # stores distance between the start and end point spaced out by step_size
         px = start_x + t * (end_x - start_x)
         py = start_y + t * (end_y - start_y)
 
-        # Ensure rays checking outside map bounds return invalid path
         raw_cols = ((px - self.map_origin_x) / self.map_res).astype(np.int32)
         raw_rows = ((py - self.map_origin_y) / self.map_res).astype(np.int32)
-        if np.any(raw_cols < 0) or np.any(raw_cols >= self.map_width) or \
-           np.any(raw_rows < 0) or np.any(raw_rows >= self.map_height):
+
+        MARGIN = 10
+        if np.any(raw_cols < MARGIN) or np.any(raw_cols >= (self.map_width - MARGIN)) or \
+           np.any(raw_rows < MARGIN) or np.any(raw_rows >= (self.map_height - MARGIN)):
             return False
 
         cols = np.clip(raw_cols, 0, self.map_width - 1)
         rows = np.clip(raw_rows, 0, self.map_height - 1)
 
-        # indices is an array it is stored as np_array
         indices = rows * self.map_width + cols
-        # costs is an array of costs
         costs = self.map_data[indices]
 
-        # If any cost above our danger threshold or is unknown (-1), return False
         if np.any(costs > self.MAX_SAFE_COST) or np.any(costs == -1): return False
         return True
 
-    def is_path_clear_dogleg(self, start_x, start_y, end_x, end_y) -> bool:
-        # 1. Fast Pass: Straight line
+    def check_path_feasibility(self, start_x, start_y, end_x, end_y):
+        # 1. Straight path check (Fastest & Strongly Preferred)
         if self.is_path_clear(start_x, start_y, end_x, end_y):
-            return True
+            return True, 'STRAIGHT'
             
+        # 2. Tangential Circumvention (Swinging wide around pillars / obstacles)
         direct_angle = math.atan2(end_y - start_y, end_x - start_x)
         total_dist = math.hypot(end_x - start_x, end_y - start_y)
         mid_dist = total_dist / 2.0
         
-        # 2. Bending Pass: Try 45 deg first (tighter), then 65 deg (wider)
+        # Test 45-deg and 60-deg arcs to push waypoints outside pillar inflation rings
         test_angles = [
             math.radians(45), math.radians(-45),
-            math.radians(65), math.radians(-65)
+            math.radians(60), math.radians(-60)
         ]
         
         for offset in test_angles:
             mid_x = start_x + (mid_dist * math.cos(direct_angle + offset))
             mid_y = start_y + (mid_dist * math.sin(direct_angle + offset))
 
-            # Checking if elbow path is clear
-            # If we can reach the elbow, and the elbow can reach the target
-            if self.is_path_clear(start_x, start_y, mid_x, mid_y):
-                if self.is_path_clear(mid_x, mid_y, end_x, end_y):
-                    return True
+            # ENHANCEMENT: Midpoint MUST lie in clean open space (cost < 15) outside the cyan inflation ring
+            if self.get_cell_cost(mid_x, mid_y) < 15:
+                if self.is_path_clear(start_x, start_y, mid_x, mid_y):
+                    if self.is_path_clear(mid_x, mid_y, end_x, end_y):
+                        return True, 'CIRCUMVENT'
                     
-        return False
+        return False, 'NONE'
 
-    def check_memory_bank(self, our_x, our_y, enemy_x, enemy_y):
-
-        # Run forward if memory bank is not empty
-        if not self.memory_bank: return []
-
-        # temporary list to hold valid points
-        still_valid_points = []
-        current_dist_to_enemy = math.hypot(our_x - enemy_x, our_y - enemy_y)
-        for mx, my, myaw in self.memory_bank:
-            mem_dist_to_enemy = math.hypot(mx - enemy_x, my - enemy_y)
-            # TUNING POINT: Hysteresis for keeping the current escape point.
-            if mem_dist_to_enemy <= (current_dist_to_enemy + 0.3): continue
-            if not self.is_path_clear_dogleg(our_x, our_y, mx, my): continue
-            if self.get_cell_cost(mx, my) > self.MAX_SAFE_COST: continue
-            still_valid_points.append((mx, my, myaw))
-        return still_valid_points
-
-    # Weight provider
     def get_adaptive_weights(self, current_cost, dist_to_enemy):
-        # TUNING POINT: These weights dictate the robot's "personality" when running away.
-        # w_dist = Prioritize getting far from enemy
-        # w_speed = Prioritize longer escape vectors
-        # w_turn = Penalty for having to turn around to escape
-        # w_cost = Penalty for running near walls
-        w_dist, w_speed, w_turn, w_cost = 10.0, 2.0, 4.0, 0.3
-        
-        # TUNING POINT: Emergency weights if near a wall or enemy
-        # Dynamic weight adjuster
-        bad_cost = 25
+        w_dist, w_speed, w_turn, w_cost = 12.0, 2.0, 3.0, 0.5
+        bad_cost = 20
         min_dist_to_enemy = 1.2
-        if current_cost > bad_cost: w_cost, w_turn = 1.0, 0.5
-        if dist_to_enemy < min_dist_to_enemy: w_dist, w_speed = 20.0, 4.0
+        if current_cost > bad_cost: w_cost, w_turn = 1.5, 0.5
+        if dist_to_enemy < min_dist_to_enemy: w_dist, w_speed = 22.0, 4.0
         return {'w_dist': w_dist, 'w_speed': w_speed, 'w_turn': w_turn, 'w_cost': w_cost}
-
-    # Checking if future path is also good
-    def evaluate_future_options(self, cand_x, cand_y):
-
-        future_clear_branches, blocked_branches = 0, 0
-        MAX_ALLOWED_BLOCKED = 4
-        # the distance the path is projected
-        probe_radius = self.sample_radii[0]
-
-        # step by 4 (speed things up) for a particular path
-        for cos_val, sin_val in self.angle_steps[::4]:
-            next_x = cand_x + (probe_radius * cos_val)
-            next_y = cand_y + (probe_radius * sin_val)
-            # Check if this path is clear
-            if self.is_path_clear_dogleg(cand_x, cand_y, next_x, next_y) and self.get_cell_cost(next_x, next_y) <= self.MAX_SAFE_COST:
-                # if a lot of 
-                future_clear_branches += 1
-            else:
-                blocked_branches += 1
-                # So if more then MAX_ALLOWED_BLOCKED are present, we stop
-                if blocked_branches >= MAX_ALLOWED_BLOCKED: return 0.0
-        return future_clear_branches * 1.5
 
     def get_safe_escape_points(self, robot_x, robot_y):
         safe_points = []
@@ -226,60 +173,145 @@ class EvasionCalculator(Node):
             for cos_val, sin_val in self.angle_steps:
                 cand_x = robot_x + (r * cos_val)
                 cand_y = robot_y + (r * sin_val)
-                # Check if the path is clear
-                if self.is_path_clear_dogleg(robot_x, robot_y, cand_x, cand_y):
-                    # Add to safe points with cost for scoring later
-                    safe_points.append((cand_x, cand_y, r, self.get_cell_cost(cand_x, cand_y)))
+
+                if self.get_cell_cost(cand_x, cand_y) > self.MAX_SAFE_COST:
+                    continue
+
+                is_clear, path_type = self.check_path_feasibility(robot_x, robot_y, cand_x, cand_y)
+                if is_clear:
+                    safe_points.append((cand_x, cand_y, r, self.get_cell_cost(cand_x, cand_y), path_type))
         return safe_points
 
     def get_best_escape_target(self, safe_points, our_x, our_y, our_yaw, enemy_x, enemy_y):
-        # Setting variables
-        best_point, highest_score, all_scored_points = None, -float('inf'), []
+        best_point, highest_score = None, -float('inf')
+        current_cost = self.get_cell_cost(our_x, our_y)
+        weights = self.get_adaptive_weights(current_cost, math.hypot(our_x - enemy_x, our_y - enemy_y))
 
-        # weight values
-        weights = self.get_adaptive_weights(self.get_cell_cost(our_x, our_y), math.hypot(our_x - enemy_x, our_y - enemy_y))
+        # Vector pointing directly away from enemy
+        away_dx = our_x - enemy_x
+        away_dy = our_y - enemy_y
+        away_angle = math.atan2(away_dy, away_dx)
 
-        # Run through the safe points collect from the get_safe_escape_point method
-        for cand_x, cand_y, r, cost in safe_points:
-            # Add points to distance and radius usage
-            score = (math.hypot(cand_x - enemy_x, cand_y - enemy_y) * weights['w_dist']) + (r * weights['w_speed'])
+        # Baseline distances along X and Y axes
+        curr_dx = abs(our_x - enemy_x)
+        curr_dy = abs(our_y - enemy_y)
 
-            
-            # Get the angle difference between us the goal pose
-            # deduct points when there big angle difference between us the goal pose
-            angle_to_cand = math.atan2(cand_y - our_y, cand_x - our_x)
-            score -= abs(math.atan2(math.sin(angle_to_cand - our_yaw), math.cos(angle_to_cand - our_yaw))) * weights['w_turn']
+        # Check if the direct 'away' path leads into a wall or pillar inflation (cost > 20 within 1.0m)
+        direct_away_x = our_x + 1.0 * math.cos(away_angle)
+        direct_away_y = our_y + 1.0 * math.sin(away_angle)
+        direct_away_blocked = self.get_cell_cost(direct_away_x, direct_away_y) > 20
+
+        # Tangential Vectors (slide left or right around obstacle)
+        tangent_left = away_angle + (math.pi / 2.0)
+        tangent_right = away_angle - (math.pi / 2.0)
+
+        for cand_x, cand_y, r, cost, path_type in safe_points:
+            dist_to_enemy = math.hypot(cand_x - enemy_x, cand_y - enemy_y)
+            score = (dist_to_enemy * weights['w_dist']) + (r * weights['w_speed'])
+
+            cand_angle = math.atan2(cand_y - our_y, cand_x - our_x)
+
+            # 1. TANGENTIAL DEFLECTION: If direct path away hits an obstacle or pillar, reward arc sliding
+            if direct_away_blocked:
+                diff_left = abs(math.atan2(math.sin(cand_angle - tangent_left), math.cos(cand_angle - tangent_left)))
+                diff_right = abs(math.atan2(math.sin(cand_angle - tangent_right), math.cos(cand_angle - tangent_right)))
+                
+                slide_score = (math.pi - min(diff_left, diff_right)) * 12.0
+                score += slide_score
+
+                # Maintain slide direction hysteresis (+20.0) to prevent left-right oscillation
+                if self.slide_direction_bias == 'LEFT' and diff_left < diff_right:
+                    score += 20.0
+                elif self.slide_direction_bias == 'RIGHT' and diff_right < diff_left:
+                    score += 20.0
+            else:
+                angle_diff_away = abs(math.atan2(math.sin(cand_angle - away_angle), math.cos(cand_angle - away_angle)))
+                score += (math.pi - angle_diff_away) * 10.0
+
+            # 2. COMPONENT-WISE DISTANCE CHECK (Soft X/Y convergence penalty)
+            cand_dx = abs(cand_x - enemy_x)
+            cand_dy = abs(cand_y - enemy_y)
+            approaching_x = cand_dx < curr_dx
+            approaching_y = cand_dy < curr_dy
+
+            if approaching_x and approaching_y:
+                score -= 30.0  # Penalize closing in on enemy along both axes
+            elif approaching_x or approaching_y:
+                score -= 8.0   # Minor penalty for closing in along one axis
+            else:
+                score += 12.0  # Reward opening distance on both axes
+
+            # 3. INFLATION SLOPE PENALTY: Severely penalize moving deeper into obstacle inflation
+            cost_increase = cost - current_cost
+            if cost_increase > 0:
+                score -= cost_increase * 3.5
+
+            turn_penalty = abs(math.atan2(math.sin(cand_angle - our_yaw), math.cos(cand_angle - our_yaw)))
+            score -= turn_penalty * weights['w_turn']
             score -= cost * weights['w_cost']
-            # Add extra points when the cost is very low
-            if 0 <= cost < 10: score += 12.0
 
-            # if the future also look good, give that path extra points
-            score += self.evaluate_future_options(cand_x, cand_y)
-            all_scored_points.append((score, cand_x, cand_y, angle_to_cand))
+            # Path Preference: Straight paths preferred (+18.0), clean circumvention arcing preferred over inflation hugging (+12.0)
+            if path_type == 'STRAIGHT':
+                score += 18.0
+            elif path_type == 'CIRCUMVENT':
+                score += 12.0
 
-            # Storing the best_point and highest_score values
+            if 0 <= cost < 10: 
+                score += 10.0
+
+            # Active target hysteresis (+25.0) locks the target point to stop DWB jitter
+            if self.active_target_x is not None and self.active_target_y is not None:
+                if math.hypot(cand_x - self.active_target_x, cand_y - self.active_target_y) < 0.4:
+                    score += 25.0
+
             if score > highest_score: 
                 highest_score = score 
-                best_point = (cand_x, cand_y, angle_to_cand)
+                best_point = (cand_x, cand_y, cand_angle)
 
-        # Sorting Alg, based on the score
-        all_scored_points.sort(key=lambda item: item[0], reverse=True)
+        if best_point is not None:
+            self.active_target_x, self.active_target_y = best_point[0], best_point[1]
+            
+            cand_angle = best_point[2]
+            diff_left = abs(math.atan2(math.sin(cand_angle - tangent_left), math.cos(cand_angle - tangent_left)))
+            diff_right = abs(math.atan2(math.sin(cand_angle - tangent_right), math.cos(cand_angle - tangent_right)))
+            self.slide_direction_bias = 'LEFT' if diff_left < diff_right else 'RIGHT'
 
-        # Store the best first #memory space paths
-        # store only the x, y, rotation values only
-        self.memory_bank = [(item[1], item[2], item[3]) for item in all_scored_points[:self.memory_space]]
         return best_point
 
+    def execute_emergency_escape(self, global_x: float, global_y: float, enemy_x: float, enemy_y: float):
+        best_x, best_y, best_yaw, max_score = None, None, None, -float('inf')
+
+        for dist in [0.4, 0.7, 1.0]:
+            for cos_val, sin_val in self.angle_steps:
+                cand_x = global_x + (dist * cos_val)
+                cand_y = global_y + (dist * sin_val)
+                if self.get_cell_cost(cand_x, cand_y) <= self.MAX_SAFE_COST:
+                    if self.is_path_clear(global_x, global_y, cand_x, cand_y):
+                        enemy_dist = math.hypot(cand_x - enemy_x, cand_y - enemy_y)
+                        ray_score = (dist * 2.0) + (enemy_dist * 5.0)
+                        if ray_score > max_score:
+                            max_score = ray_score
+                            best_x, best_y = cand_x, cand_y
+                            best_yaw = math.atan2(sin_val, cos_val)
+
+        if best_x is not None:
+            return best_x, best_y, best_yaw
+
+        dx = global_x - enemy_x
+        dy = global_y - enemy_y
+        dist = math.hypot(dx, dy)
+        if dist == 0: dist = 0.01
+        return global_x + (dx / dist) * 0.4, global_y + (dy / dist) * 0.4, math.atan2(dy, dx)
+
     def control_loop(self):
-        if self.map_data is None:
-            return
-
-        if self.current_state != 'EVADING':
+        if self.map_data is None or self.current_state != 'EVADING':
             self.last_target_x = None
-            self.memory_bank.clear()
+            self.last_target_y = None
+            self.active_target_x = None
+            self.active_target_y = None
+            self.slide_direction_bias = None
             return
 
-        # Getting our position
         try:
             tf_global = self.tf_buffer.lookup_transform(
                 self.map_frame, self.robot_frame, rclpy.time.Time(), 
@@ -296,39 +328,26 @@ class EvasionCalculator(Node):
         our_yaw = self.get_yaw_from_quaternion(tf_global.transform.rotation)
         enemy_global_x, enemy_global_y = tf_enemy_global.transform.translation.x, tf_enemy_global.transform.translation.y
 
-        # If we have a valid cached point, use it. Otherwise, compute new escape points.
-        valid_cached_points = self.check_memory_bank(global_x, global_y, enemy_global_x, enemy_global_y)
-        if valid_cached_points:
-            target_x, target_y, target_yaw = valid_cached_points[0]
-        else:
-            safe_points = self.get_safe_escape_points(global_x, global_y)
-            
-            if not safe_points:
-                # Emergency fallback if no safe getaway point exists
-                self.get_logger().warn("No safe points! Executing forward U-turn escape.")
-                dx = global_x - enemy_global_x
-                dy = global_y - enemy_global_y
-                dist = math.hypot(dx, dy)
-                if dist == 0: dist = 0.01
-                
-                target_x = global_x + (dx / dist) * 1.0
-                target_y = global_y + (dy / dist) * 1.0
-                target_yaw = math.atan2(dy, dx)
-            else:
-                # get the best path and put that as the goal
-                best_target = self.get_best_escape_target(safe_points, global_x, global_y, our_yaw, enemy_global_x, enemy_global_y)
-                if best_target is None: 
-                    return
-                target_x, target_y, target_yaw = best_target
-
+        safe_points = self.get_safe_escape_points(global_x, global_y)
         
+        if not safe_points:
+            target_x, target_y, target_yaw = self.execute_emergency_escape(global_x, global_y, enemy_global_x, enemy_global_y)
+        else:
+            best_target = self.get_best_escape_target(safe_points, global_x, global_y, our_yaw, enemy_global_x, enemy_global_y)
+            if best_target is None: 
+                return
+            target_x, target_y, target_yaw = best_target
+
+        if self.last_target_x is not None and self.last_target_y is not None:
+            alpha = 0.5
+            target_x = alpha * target_x + (1.0 - alpha) * self.last_target_x
+            target_y = alpha * target_y + (1.0 - alpha) * self.last_target_y
+
         if self.last_target_x is not None: 
             if math.hypot(target_x - self.last_target_x, target_y - self.last_target_y) < self.MIN_UPDATE_DIST: return        
         
         self.last_target_x, self.last_target_y = target_x, target_y
 
-        # UNCONDITIONAL BROADCAST: 
-        # Ensures goal_sender always has a target to follow
         t = TransformStamped()
         t.header.stamp = self.get_clock().now().to_msg()
         t.header.frame_id = self.map_frame
