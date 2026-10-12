@@ -16,7 +16,7 @@ our_bot/global_costmap/global_costmap:
     global_frame: map
     robot_base_frame: our_bot/base_link
     use_sim_time: True
-    resolution: 0.06
+    resolution: 0.05
     track_unknown_space: true
     transform_tolerance: 0.2
     footprint: "[[ 0.189,  0.000],
