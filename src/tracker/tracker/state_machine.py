@@ -17,13 +17,12 @@ class StateMachine(Node):
         # Created our own publisher for robot state to avoid circular dependency with goal_sender
         self.state_pub = self.create_publisher(String, 'our_bot/robot_state', 10)
 
-        # ENHANCEMENT: Hold time ONLY applies when exiting EVADING so evasion bursts complete,
-        # but CHASING -> EVADING transitions are INSTANT.
-        self.min_evasion_duration = 0.6  
-        self.last_evasion_start_time = 0.0
+        # ENHANCEMENT: Debounce timer to ensure robot commits to state bursts without chattering
+        self.min_state_duration = 0.6  # Hold state for at least 0.6 seconds
+        self.last_state_change_time = 0.0
 
         self.timer = self.create_timer(0.1, self.control_loop)
-        self.get_logger().info("State Machine Initialized (High-Sensitivity Threat Curve).")
+        self.get_logger().info("State Machine Initialized (Smooth Angular Threat Curve).")
 
     def get_pursuer_in_enemy_frame(self):
         try:
@@ -40,16 +39,16 @@ class StateMachine(Node):
         distance = math.hypot(rel_x, rel_y)
         relative_angle_deg = abs(math.degrees(math.atan2(rel_y, rel_x)))
 
-        # SENSITIVE THREAT ENVELOPE:
-        # Front (0 deg)   -> 3.0m threshold
-        # Flank (90 deg)  -> 2.0m threshold
+        # CONTINUOUS THREAT INTERPOLATION:
+        # Front (0 deg)  -> 2.6m threshold
+        # Flank (90 deg)  -> 1.5m threshold
         # Rear (180 deg)  -> 0.0m threshold (safe behind)
         if relative_angle_deg <= 90.0:
             ratio = relative_angle_deg / 90.0
-            current_threshold = 3.0 - (1.0 * ratio)
+            current_threshold = 2.6 - (1.1 * ratio)
         else:
             ratio = (relative_angle_deg - 90.0) / 90.0
-            current_threshold = 2.0 - (2.0 * ratio)
+            current_threshold = 1.5 - (1.5 * ratio)
             
         if distance > current_threshold:
             return False, distance, current_threshold
@@ -63,22 +62,23 @@ class StateMachine(Node):
             return
 
         now_sec = self.get_clock().now().nanoseconds / 1e9
-        time_in_evasion = now_sec - self.last_evasion_start_time
+        time_in_state = now_sec - self.last_state_change_time
 
         in_danger, dist, threshold = self.evaluate_threat_state(rel_x, rel_y)
 
         if self.state == 'CHASING':
-            # INSTANT SENSITIVITY: Switch to EVADING immediately on threat detection (no lockout delay)
-            if in_danger:
+            # Enter EVADING immediately if threat line is crossed and hold time met
+            if in_danger and time_in_state >= self.min_state_duration:
                 self.get_logger().warn(f'DANGER ZONE! Dist: {dist:.2f}m <= {threshold:.2f}m. Switching to EVADING.')
                 self.state = 'EVADING'
-                self.last_evasion_start_time = now_sec
+                self.last_state_change_time = now_sec
 
         elif self.state == 'EVADING':
-            # Require robot to clear threat + 0.5m hysteresis AND hold evasion for at least 0.6s
-            if not in_danger and dist > (threshold + 0.5) and time_in_evasion >= self.min_evasion_duration:
+            # TUNING POINT: Exit hysteresis buffer (+0.5m) and hold time check to prevent state chatter
+            if not in_danger and dist > (threshold + 0.5) and time_in_state >= self.min_state_duration:
                 self.get_logger().info(f'Clear of threat (Dist: {dist:.2f}m). Resuming CHASING.')
                 self.state = 'CHASING'
+                self.last_state_change_time = now_sec
 
         msg = String()
         msg.data = self.state
