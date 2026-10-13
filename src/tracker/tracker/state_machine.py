@@ -19,7 +19,14 @@ class StateMachine(Node):
 
         # ENHANCEMENT: Debounce timer to ensure robot commits to state bursts without chattering
         self.min_state_duration = 0.6  # Hold state for at least 0.6 seconds
-        self.last_state_change_time = 0.0
+        
+        # NEW: Properly initialize time tracking variables
+        # Using 0.0 can cause issues with ROS 2 clock initialization depending on the time source.
+        self.last_state_change_time = None
+        self.last_tf_success_time = None
+        
+        # NEW: Timeout duration (seconds) before assuming the enemy is lost
+        self.tf_timeout_duration = 2.0 
 
         self.timer = self.create_timer(0.1, self.control_loop)
         self.get_logger().info("State Machine Initialized (Smooth Angular Threat Curve).")
@@ -56,26 +63,51 @@ class StateMachine(Node):
         return True, distance, current_threshold
 
     def control_loop(self):
+        now_sec = self.get_clock().now().nanoseconds / 1e9
+        
+        # Initialize timestamps on first successful loop
+        if self.last_state_change_time is None:
+            self.last_state_change_time = now_sec
+            self.last_tf_success_time = now_sec
+
+        time_in_state = now_sec - self.last_state_change_time
+
         # Get the relative position of our bot in the enemy bot's frame
         rel_x, rel_y = self.get_pursuer_in_enemy_frame()
+        
+        # NEW: Handle Missing Enemy / Sensor Loss safely
         if rel_x is None: 
+            time_since_last_tf = now_sec - self.last_tf_success_time
+            if time_since_last_tf > self.tf_timeout_duration and self.state != 'CHASING':
+                self.get_logger().warn(f'Enemy tracking lost for {time_since_last_tf:.1f}s. Reverting to CHASING (Search).')
+                self.state = 'CHASING'
+                self.last_state_change_time = now_sec
+            
+            # Publish current state and exit early
+            msg = String()
+            msg.data = self.state
+            self.state_pub.publish(msg)
             return
 
-        now_sec = self.get_clock().now().nanoseconds / 1e9
-        time_in_state = now_sec - self.last_state_change_time
+        # Record successful TF lookup
+        self.last_tf_success_time = now_sec
 
         in_danger, dist, threshold = self.evaluate_threat_state(rel_x, rel_y)
 
         if self.state == 'CHASING':
-            # Enter EVADING immediately if threat line is crossed and hold time met
-            if in_danger and time_in_state >= self.min_state_duration:
+            # NEW: Asymmetrical Debouncing.
+            # We REMOVED the `time_in_state >= self.min_state_duration` check here.
+            # If the robot is in danger, it must evade INSTANTLY. Survival cannot wait for a debounce timer.
+            if in_danger:
                 self.get_logger().warn(f'DANGER ZONE! Dist: {dist:.2f}m <= {threshold:.2f}m. Switching to EVADING.')
                 self.state = 'EVADING'
                 self.last_state_change_time = now_sec
 
         elif self.state == 'EVADING':
-            # TUNING POINT: Exit hysteresis buffer (+0.5m) and hold time check to prevent state chatter
-            if not in_danger and dist > (threshold + 0.5) and time_in_state >= self.min_state_duration:
+            # TUNING POINT: Exit hysteresis buffer (+0.2m) and hold time check to prevent state chatter
+            # NEW: Reduced hysteresis from +0.5m to +0.2m to prevent the "Hysteresis Trap",
+            # allowing the robot to resume chasing without having to retreat exceptionally far if the enemy turns towards it.
+            if not in_danger and dist > (threshold + 0.2) and time_in_state >= self.min_state_duration:
                 self.get_logger().info(f'Clear of threat (Dist: {dist:.2f}m). Resuming CHASING.')
                 self.state = 'CHASING'
                 self.last_state_change_time = now_sec
