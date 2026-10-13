@@ -29,10 +29,17 @@ class EvasionCalculator(Node):
         self.costmap_sub = self.create_subscription(OccupancyGrid, '/our_bot/global_costmap/costmap', self.costmap_callback, 10)
 
         # TUNING POINT: Distances (meters) to search for safe escape points.
-        self.sample_radii = [0.6, 1.0, 1.5, 2.0]
+        # NEW: Converted to a NumPy array for vectorized grid generation.
+        self.sample_radii = np.array([0.6, 1.0, 1.5, 2.0])
         
         # TUNING POINT: Search angle resolution. 10 degrees (36 steps) balances coverage and CPU speed.
-        self.angle_steps = [(math.cos(math.radians(deg)), math.sin(math.radians(deg))) for deg in range(0, 360, 10)]
+        # NEW: Precomputing a flattened NumPy grid of all candidate x and y offsets.
+        # This completely removes the nested loops during candidate generation and saves immense CPU time.
+        angles = np.deg2rad(np.arange(0, 360, 10))
+        r_grid, a_grid = np.meshgrid(self.sample_radii, angles)
+        self.cand_dx = (r_grid * np.cos(a_grid)).flatten()
+        self.cand_dy = (r_grid * np.sin(a_grid)).flatten()
+        self.cand_r = r_grid.flatten()
 
         self.map_data = None
         self.map_res = 0.05
@@ -71,7 +78,6 @@ class EvasionCalculator(Node):
 
     # Get the map info from the topic
     def costmap_callback(self, msg: OccupancyGrid):
-
         self.map_data = np.array(msg.data, dtype=np.int16)
         self.map_res = msg.info.resolution
 
@@ -81,9 +87,8 @@ class EvasionCalculator(Node):
         self.map_origin_x = msg.info.origin.position.x
         self.map_origin_y = msg.info.origin.position.y
 
-    # Getting cost of ONE CELL AT A TIME
+    # Getting cost of ONE CELL AT A TIME (Kept for singular checks like our_x/our_y)
     def get_cell_cost(self, x: float, y: float) -> int:
-
         if self.map_data is None: return 100
         raw_col = int((x - self.map_origin_x) / self.map_res)
         raw_row = int((y - self.map_origin_y) / self.map_res)
@@ -101,9 +106,29 @@ class EvasionCalculator(Node):
         cost = self.map_data[row * self.map_width + col]
         return 100 if cost == -1 else cost
 
-    # Getting Cost of ONE Line AT A TIME
-    def is_path_clear(self, start_x: float, start_y: float, end_x: float, end_y: float) -> bool:
+    # NEW: Vectorized cell cost checking. Processes arrays of X and Y coordinates instantly
+    # rather than looping through the 144 candidate points one by one.
+    def get_cell_costs_vectorized(self, xs: np.ndarray, ys: np.ndarray) -> np.ndarray:
+        if self.map_data is None: return np.full(xs.shape, 100)
+        
+        raw_cols = ((xs - self.map_origin_x) / self.map_res).astype(np.int32)
+        raw_rows = ((ys - self.map_origin_y) / self.map_res).astype(np.int32)
+        
+        MARGIN = 15
+        invalid = (raw_cols < MARGIN) | (raw_cols >= (self.map_width - MARGIN)) | \
+                  (raw_rows < MARGIN) | (raw_rows >= (self.map_height - MARGIN))
+                  
+        cols = np.clip(raw_cols, 0, self.map_width - 1)
+        rows = np.clip(raw_rows, 0, self.map_height - 1)
+        
+        costs = self.map_data[rows * self.map_width + cols]
+        costs = np.where(costs == -1, 100, costs)
+        costs[invalid] = 100
+        
+        return costs
 
+    # Getting Cost of ONE Line AT A TIME
+    def is_path_clear(self, start_x: float, start_y: float, end_x: float, end_y: float, max_cost: int) -> bool:
         if self.map_data is None: return False
         dist = math.hypot(end_x - start_x, end_y - start_y)
 
@@ -128,25 +153,25 @@ class EvasionCalculator(Node):
         indices = rows * self.map_width + cols
         costs = self.map_data[indices]
 
-        if np.any(costs > self.MAX_SAFE_COST) or np.any(costs == -1): return False
+        # Use the dynamic max_cost instead of the hardcoded MAX_SAFE_COST
+        if np.any(costs > max_cost) or np.any(costs == -1): return False
         return True
 
-    def check_path_feasibility(self, start_x, start_y, end_x, end_y):
-        if self.is_path_clear(start_x, start_y, end_x, end_y):
+    def check_path_feasibility(self, start_x, start_y, end_x, end_y, max_cost):
+        if self.is_path_clear(start_x, start_y, end_x, end_y, max_cost):
             return True, 'STRAIGHT'
             
         direct_angle = math.atan2(end_y - start_y, end_x - start_x)
         total_dist = math.hypot(end_x - start_x, end_y - start_y)
         mid_dist = total_dist / 2.0
         
-        test_angles = [math.radians(45), math.radians(-45)]
+        test_angles = np.deg2rad([30, -30, 45, -45, 60, -60, 90, -90])
+        mid_x = start_x + (mid_dist * np.cos(direct_angle + test_angles))
+        mid_y = start_y + (mid_dist * np.sin(direct_angle + test_angles))
         
-        for offset in test_angles:
-            mid_x = start_x + (mid_dist * math.cos(direct_angle + offset))
-            mid_y = start_y + (mid_dist * math.sin(direct_angle + offset))
-
-            if self.is_path_clear(start_x, start_y, mid_x, mid_y):
-                if self.is_path_clear(mid_x, mid_y, end_x, end_y):
+        for i in range(len(test_angles)):
+            if self.is_path_clear(start_x, start_y, mid_x[i], mid_y[i], max_cost):
+                if self.is_path_clear(mid_x[i], mid_y[i], end_x, end_y, max_cost):
                     return True, 'DOGLEG'
                     
         return False, 'NONE'
@@ -160,22 +185,37 @@ class EvasionCalculator(Node):
         return {'w_dist': w_dist, 'w_speed': w_speed, 'w_turn': w_turn, 'w_cost': w_cost}
 
     def get_safe_escape_points(self, robot_x, robot_y):
+        cand_x = robot_x + self.cand_dx
+        cand_y = robot_y + self.cand_dy
+        
+        costs = self.get_cell_costs_vectorized(cand_x, cand_y)
+        
+        # NEW: Dynamic Recovery Threshold.
+        # If the robot was pushed into a wall (e.g., cost 60) by the emergency code,
+        # we temporarily allow the normal evasion code to search through cells up to 60.
+        # This breaks the emergency loop and lets normal evasion drive us back to 0-cost open space.
+        current_cost = self.get_cell_cost(robot_x, robot_y)
+        effective_max_cost = max(self.MAX_SAFE_COST, current_cost)
+        
+        valid_mask = costs <= effective_max_cost
+        
+        valid_x = cand_x[valid_mask]
+        valid_y = cand_y[valid_mask]
+        valid_r = self.cand_r[valid_mask]
+        valid_costs = costs[valid_mask]
+        
         safe_points = []
-        for r in self.sample_radii:
-            for cos_val, sin_val in self.angle_steps:
-                cand_x = robot_x + (r * cos_val)
-                cand_y = robot_y + (r * sin_val)
-
-                if self.get_cell_cost(cand_x, cand_y) > self.MAX_SAFE_COST:
-                    continue
-
-                is_clear, path_type = self.check_path_feasibility(robot_x, robot_y, cand_x, cand_y)
-                if is_clear:
-                    safe_points.append((cand_x, cand_y, r, self.get_cell_cost(cand_x, cand_y), path_type))
+        for i in range(len(valid_x)):
+            # Pass the dynamic threshold to the feasibility checker
+            is_clear, path_type = self.check_path_feasibility(robot_x, robot_y, valid_x[i], valid_y[i], effective_max_cost)
+            if is_clear:
+                safe_points.append((valid_x[i], valid_y[i], valid_r[i], valid_costs[i], path_type))
+                
         return safe_points
 
     def get_best_escape_target(self, safe_points, our_x, our_y, our_yaw, enemy_x, enemy_y):
-        best_point, highest_score = None, -float('inf')
+        if not safe_points: return None
+
         current_cost = self.get_cell_cost(our_x, our_y)
         weights = self.get_adaptive_weights(current_cost, math.hypot(our_x - enemy_x, our_y - enemy_y))
 
@@ -193,90 +233,126 @@ class EvasionCalculator(Node):
         tangent_left = away_angle + (math.pi / 2.0)
         tangent_right = away_angle - (math.pi / 2.0)
 
-        for cand_x, cand_y, r, cost, path_type in safe_points:
-            dist_to_enemy = math.hypot(cand_x - enemy_x, cand_y - enemy_y)
-            score = (dist_to_enemy * weights['w_dist']) + (r * weights['w_speed'])
+        # NEW: Unpack the safe_points list into NumPy arrays to evaluate all scores at once
+        c_x = np.array([p[0] for p in safe_points])
+        c_y = np.array([p[1] for p in safe_points])
+        c_r = np.array([p[2] for p in safe_points])
+        c_cost = np.array([p[3] for p in safe_points])
+        c_is_straight = np.array([1.0 if p[4] == 'STRAIGHT' else 0.0 for p in safe_points])
 
-            cand_angle = math.atan2(cand_y - our_y, cand_x - our_x)
+        # Vectorized Base Scoring: Distance to enemy and candidate radius
+        dist_to_enemy = np.hypot(c_x - enemy_x, c_y - enemy_y)
+        scores = (dist_to_enemy * weights['w_dist']) + (c_r * weights['w_speed'])
 
-            # 1. TANGENTIAL DEFLECTION: If direct path away is blocked by a wall, reward sliding parallel to wall
-            if direct_away_blocked:
-                diff_left = abs(math.atan2(math.sin(cand_angle - tangent_left), math.cos(cand_angle - tangent_left)))
-                diff_right = abs(math.atan2(math.sin(cand_angle - tangent_right), math.cos(cand_angle - tangent_right)))
-                
-                # Favor tangential sliding score
-                slide_score = (math.pi - min(diff_left, diff_right)) * 12.0
-                score += slide_score
+        # Calculate angles for all points
+        cand_angle = np.arctan2(c_y - our_y, c_x - our_x)
 
-                # Maintain slide direction hysteresis (+20.0) to stop left-right zigzagging along the wall
-                if self.slide_direction_bias == 'LEFT' and diff_left < diff_right:
-                    score += 20.0
-                elif self.slide_direction_bias == 'RIGHT' and diff_right < diff_left:
-                    score += 20.0
-            else:
-                # Direct away path is open—reward moving straight away
-                angle_diff_away = abs(math.atan2(math.sin(cand_angle - away_angle), math.cos(cand_angle - away_angle)))
-                score += (math.pi - angle_diff_away) * 10.0
-
-            # 2. INFLATION SLOPE PENALTY: Severely penalize moving deeper into wall inflation!
-            cost_increase = cost - current_cost
-            if cost_increase > 0:
-                score -= cost_increase * 3.5  # Heavy penalty for heading towards higher cost/walls
-
-            turn_penalty = abs(math.atan2(math.sin(cand_angle - our_yaw), math.cos(cand_angle - our_yaw)))
-            score -= turn_penalty * weights['w_turn']
-            score -= cost * weights['w_cost']
-
-            if path_type == 'STRAIGHT':
-                score += 15.0
-
-            if 0 <= cost < 10: 
-                score += 10.0
-
-            # Active target hysteresis (+25.0) locks the target point so DWB doesn't wobble
-            if self.active_target_x is not None and self.active_target_y is not None:
-                if math.hypot(cand_x - self.active_target_x, cand_y - self.active_target_y) < 0.4:
-                    score += 25.0
-
-            if score > highest_score: 
-                highest_score = score 
-                best_point = (cand_x, cand_y, cand_angle)
-
-        if best_point is not None:
-            self.active_target_x, self.active_target_y = best_point[0], best_point[1]
+        # 1. TANGENTIAL DEFLECTION
+        if direct_away_blocked:
+            diff_left = np.abs(np.arctan2(np.sin(cand_angle - tangent_left), np.cos(cand_angle - tangent_left)))
+            diff_right = np.abs(np.arctan2(np.sin(cand_angle - tangent_right), np.cos(cand_angle - tangent_right)))
             
-            # Remember whether we are sliding left or right to keep momentum smooth
-            cand_angle = best_point[2]
-            diff_left = abs(math.atan2(math.sin(cand_angle - tangent_left), math.cos(cand_angle - tangent_left)))
-            diff_right = abs(math.atan2(math.sin(cand_angle - tangent_right), math.cos(cand_angle - tangent_right)))
-            self.slide_direction_bias = 'LEFT' if diff_left < diff_right else 'RIGHT'
+            # Favor tangential sliding score
+            slide_score = (np.pi - np.minimum(diff_left, diff_right)) * 12.0
+            scores += slide_score
+
+            # Maintain slide direction hysteresis (+20.0) to stop left-right zigzagging along the wall
+            if self.slide_direction_bias == 'LEFT':
+                scores = np.where(diff_left < diff_right, scores + 20.0, scores)
+            elif self.slide_direction_bias == 'RIGHT':
+                scores = np.where(diff_right < diff_left, scores + 20.0, scores)
+        else:
+            # Direct away path is open—reward moving straight away
+            angle_diff_away = np.abs(np.arctan2(np.sin(cand_angle - away_angle), np.cos(cand_angle - away_angle)))
+            scores += (np.pi - angle_diff_away) * 10.0
+
+        # 2. INFLATION SLOPE PENALTY: Severely penalize moving deeper into wall inflation!
+        cost_increase = c_cost - current_cost
+        scores = np.where(cost_increase > 0, scores - (cost_increase * 3.5), scores)
+
+        # NEW: Absolute Wall Penalty. If the candidate cell is deep in inflation (> 20),
+        # heavily penalize it regardless of the robot's current cost. This prevents the bot
+        # from lingering in walls when safe open spaces exist nearby.
+        scores = np.where(c_cost > 20, scores - (c_cost * 2.5), scores)
+
+        # Vectorized turn penalties and cost penalties
+        turn_penalty = np.abs(np.arctan2(np.sin(cand_angle - our_yaw), np.cos(cand_angle - our_yaw)))
+        scores -= turn_penalty * weights['w_turn']
+        scores -= c_cost * weights['w_cost']
+
+        # Vectorized path type bonuses
+        scores += c_is_straight * 15.0
+        scores = np.where((c_cost >= 0) & (c_cost < 10), scores + 10.0, scores)
+
+        # Active target hysteresis (+25.0) locks the target point so DWB doesn't wobble
+        if self.active_target_x is not None and self.active_target_y is not None:
+            active_dists = np.hypot(c_x - self.active_target_x, c_y - self.active_target_y)
+            scores = np.where(active_dists < 0.4, scores + 25.0, scores)
+
+        # NEW: Find the index of the highest score instantly using NumPy
+        best_idx = np.argmax(scores)
+        best_point = (c_x[best_idx], c_y[best_idx], cand_angle[best_idx])
+        
+        self.active_target_x, self.active_target_y = best_point[0], best_point[1]
+        
+        # Remember whether we are sliding left or right to keep momentum smooth
+        chosen_angle = best_point[2]
+        dl = abs(math.atan2(math.sin(chosen_angle - tangent_left), math.cos(chosen_angle - tangent_left)))
+        dr = abs(math.atan2(math.sin(chosen_angle - tangent_right), math.cos(chosen_angle - tangent_right)))
+        self.slide_direction_bias = 'LEFT' if dl < dr else 'RIGHT'
 
         return best_point
 
     def execute_emergency_escape(self, global_x: float, global_y: float, enemy_x: float, enemy_y: float):
-        best_x, best_y, best_yaw, max_score = None, None, None, -float('inf')
+        # NEW: Emergency mode logic. 
+        # Since standard safe paths failed, we are likely cornered or deep in inflation.
+        # We generate a fast, localized star-pattern of candidate points.
+        em_radii = np.array([0.3, 0.6, 0.9])
+        angles = np.deg2rad(np.arange(0, 360, 15)) # 24 directions for speed and density
+        
+        r_grid, a_grid = np.meshgrid(em_radii, angles)
+        cand_x = global_x + (r_grid * np.cos(a_grid)).flatten()
+        cand_y = global_y + (r_grid * np.sin(a_grid)).flatten()
+        
+        # Get costs for all emergency candidates instantly
+        costs = self.get_cell_costs_vectorized(cand_x, cand_y)
+        
+        # NEW: Relax the cost threshold. 
+        # In an emergency, we accept ANY cell that isn't a lethal solid wall (< 90).
+        valid_mask = costs < 90
 
-        for dist in [0.4, 0.7, 1.0]:
-            for cos_val, sin_val in self.angle_steps:
-                cand_x = global_x + (dist * cos_val)
-                cand_y = global_y + (dist * sin_val)
-                if self.get_cell_cost(cand_x, cand_y) <= self.MAX_SAFE_COST:
-                    if self.is_path_clear(global_x, global_y, cand_x, cand_y):
-                        enemy_dist = math.hypot(cand_x - enemy_x, cand_y - enemy_y)
-                        ray_score = (dist * 2.0) + (enemy_dist * 5.0)
-                        if ray_score > max_score:
-                            max_score = ray_score
-                            best_x, best_y = cand_x, cand_y
-                            best_yaw = math.atan2(sin_val, cos_val)
+        # Test Printing
+        self.get_logger().warn("USING THE EMERGENCY METHOD!")
 
-        if best_x is not None:
+        if np.any(valid_mask):
+            valid_x = cand_x[valid_mask]
+            valid_y = cand_y[valid_mask]
+            valid_costs = costs[valid_mask]
+            
+            # Calculate distance to enemy for the valid points
+            dist_to_enemy = np.hypot(valid_x - enemy_x, valid_y - enemy_y)
+            
+            # NEW: Emergency Scoring Strategy (Costmap Descent)
+            # We want to maximize distance from the enemy, but we HEAVILY penalize cell cost.
+            # This forces the robot to squeeze along the path of least resistance (lowest cost) 
+            # to "slide" out of corners, rather than just driving blindly away from the enemy.
+            scores = (dist_to_enemy * 25.0) - (valid_costs * 1.5)
+            
+            best_idx = np.argmax(scores)
+            best_x = valid_x[best_idx]
+            best_y = valid_y[best_idx]
+            best_yaw = math.atan2(best_y - global_y, best_x - global_x)
+            
             return best_x, best_y, best_yaw
 
+        # ABSOLUTE FALLBACK: Every single cell around us is a lethal wall (cost >= 90).
+        # We are completely boxed in. Do not attempt to drive into the wall.
+        # Just command the robot to spin in place to face away from the enemy.
         dx = global_x - enemy_x
         dy = global_y - enemy_y
-        dist = math.hypot(dx, dy)
-        if dist == 0: dist = 0.01
-        return global_x + (dx / dist) * 0.4, global_y + (dy / dist) * 0.4, math.atan2(dy, dx)
+        escape_yaw = math.atan2(dy, dx) if math.hypot(dx, dy) > 0.01 else 0.0
+        
+        return global_x, global_y, escape_yaw
 
     def control_loop(self):
         if self.map_data is None or self.current_state != 'EVADING':
