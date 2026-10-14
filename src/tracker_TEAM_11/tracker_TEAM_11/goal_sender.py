@@ -9,15 +9,26 @@ from rclpy.action import ActionClient
 from action_msgs.msg import GoalStatus
 from sensor_msgs.msg import CompressedImage
 import tf2_ros
+import sys
 
-# Import your newly created custom message
-from tracker_msgs.msg import TrackerReport
+# --- ROBUST IMPORT ---
+# Prevents node crash if tracker_msgs is missing/un-sourced
+try:
+    from tracker_msgs.msg import TrackerReport
+    HAS_TRACKER_MSGS = True
+except ImportError:
+    HAS_TRACKER_MSGS = False
+    print("\n[CRITICAL WARNING]: 'tracker_msgs' not found! The node will run and send goals, but TrackerReports will NOT be published.\n", file=sys.stderr)
 
 class GoalSender(Node):
+    """
+    GoalSender tracks the dynamic targets and dispatches throttled PoseStamped 
+    goals to the Nav2 Action Server. It publishes TrackerReports upon success.
+    """
     def __init__(self):
         super().__init__('goal_sender')
 
-        # Dynamic namespace configuration
+        # --- Dynamic Namespace Setup ---
         raw_ns = self.get_namespace().strip('/')
         default_robot_ns = raw_ns if raw_ns else 'our_bot'
 
@@ -43,6 +54,7 @@ class GoalSender(Node):
         self.chase_frame = self.get_parameter('chase_frame').value
         self.escape_frame = self.get_parameter('escape_frame').value
 
+        # --- Internal State ---
         self.last_goal_time = 0.0
         self.state = 'CHASING'
         self.last_sent_pose = None
@@ -50,37 +62,37 @@ class GoalSender(Node):
         self.is_goal_pending = False
         self.force_update = False 
 
-        # --- CAMERA & REPORTING SETUP ---
+        # --- Camera Setup ---
         self.tracker_image = None
-
         camera_topic = f'/{self.robot_ns}/oakd/rgb/preview/image_raw/compressed' if self.robot_ns else '/oakd/rgb/preview/image_raw/compressed'
         self.image_sub = self.create_subscription(CompressedImage, camera_topic, self.image_cb, 10)
 
-        report_topic = f'/{self.robot_ns}/tracker_report' if self.robot_ns else '/tracker_report'
-        self.report_pub = self.create_publisher(TrackerReport, report_topic, 10)
+        # Only register custom publishers if the message package was successfully imported
+        if HAS_TRACKER_MSGS:
+            report_topic = f'/{self.robot_ns}/tracker_report' if self.robot_ns else '/tracker_report'
+            self.report_pub = self.create_publisher(TrackerReport, report_topic, 10)
 
-        report_img_topic = f'/{self.robot_ns}/tracker_report_img/compressed' if self.robot_ns else '/tracker_report_img/compressed'
-        self.report_img_pub = self.create_publisher(CompressedImage, report_img_topic, 10)
-        # --------------------------------
+            report_img_topic = f'/{self.robot_ns}/tracker_report_img/compressed' if self.robot_ns else '/tracker_report_img/compressed'
+            self.report_img_pub = self.create_publisher(CompressedImage, report_img_topic, 10)
 
+        # --- TF2 & Action Client ---
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         state_topic = f'/{self.robot_ns}/robot_state' if self.robot_ns else '/robot_state'
         self.state_sub = self.create_subscription(String, state_topic, self.state_cb, 10)
+        
         self.nav_client = ActionClient(self, NavigateToPose, self.action_name)
         
         self.timer = self.create_timer(0.05, self.control_loop)
-        self.get_logger().info("Robust Goal Sender initialized with Camera & Reporting.")
+        self.get_logger().info(f"Goal Sender initialized. Waiting for Nav2 Action Server...")
 
     def image_cb(self, msg):
-        """Cache the latest image from the camera."""
         self.tracker_image = msg
 
     def state_cb(self, msg):
         new_state = msg.data
         if self.state != new_state:
-            self.get_logger().info(f"State transition: {self.state} -> {new_state}. Utilizing Nav2 preemption.")
             self.state = new_state
             self.force_update = True 
 
@@ -106,50 +118,36 @@ class GoalSender(Node):
             goal_handle = future.result()
             if goal_handle.accepted:
                 self.active_goal_handle = goal_handle
-                
-                # --- HOOK UP THE RESULT CALLBACK ---
                 result_future = goal_handle.get_result_async()
                 result_future.add_done_callback(self.goal_result_callback)
             else:
                 self.active_goal_handle = None
         except Exception as e:
-            self.get_logger().warn(f"Goal dispatch exception: {e}")
             self.active_goal_handle = None
 
     def goal_result_callback(self, future):
-        """Fires when the goal actually completes (Succeeds, Aborts, or Cancels)."""
         result = future.result()
-        
         if result.status == GoalStatus.STATUS_SUCCEEDED:
-            if self.tracker_image is None:
-                self.get_logger().warn("Goal succeeded but No Image Available. Cannot generate report.")
-                return
+            if not HAS_TRACKER_MSGS: return 
+            if self.tracker_image is None: return
 
             try:
-                # Lookup enemy relative to chaser to calculate rel_dist and rel_orient
                 rel_tf = self.tf_buffer.lookup_transform(
-                    self.robot_frame, self.enemy_frame, rclpy.time.Time(),
-                    timeout=rclpy.duration.Duration(seconds=0.1)
+                    self.robot_frame, self.enemy_frame, rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=0.1)
                 )
                 rel_x = rel_tf.transform.translation.x
                 rel_y = rel_tf.transform.translation.y
-                rel_q = rel_tf.transform.rotation
-                
                 rel_dist = math.hypot(rel_x, rel_y)
-                rel_orient = math.degrees(self.get_yaw_from_quaternion(rel_q))
-
-            except tf2_ros.TransformException as e:
-                self.get_logger().warn(f"TF lookup failed for reporting: {e}")
+                rel_orient = math.degrees(self.get_yaw_from_quaternion(rel_tf.transform.rotation))
+            except tf2_ros.TransformException:
                 return
 
-            # Extract IDs (e.g. 'tb402' -> 2)
             try:
                 my_id_val = int(self.robot_ns[-2:]) if len(self.robot_ns) > 2 else 1
                 opp_id_val = int(self.enemy_ns[-2:]) if len(self.enemy_ns) > 2 else 2
             except ValueError:
                 my_id_val, opp_id_val = 1, 2
 
-            # Populate and send the TrackerReport
             report = TrackerReport()
             report.image = self.tracker_image
             report.my_id = my_id_val
@@ -159,16 +157,9 @@ class GoalSender(Node):
 
             self.report_pub.publish(report)
             self.report_img_pub.publish(self.tracker_image)
-            self.get_logger().info("Goal succeeded! Published TrackerReport.")
-            
-        elif result.status == GoalStatus.STATUS_ABORTED:
-            self.get_logger().debug("Goal aborted.")
-        elif result.status == GoalStatus.STATUS_CANCELED:
-            self.get_logger().debug("Goal canceled.")
 
     def control_loop(self):
-        if not self.nav_client.wait_for_server(timeout_sec=0.01): 
-            return
+        if not self.nav_client.wait_for_server(timeout_sec=0.01): return
 
         now_sec = self.get_clock().now().nanoseconds / 1e9
 
@@ -177,14 +168,12 @@ class GoalSender(Node):
 
         if self.is_goal_pending: 
             if (now_sec - self.last_goal_time) > 0.5:
-                self.get_logger().warn("Goal response timed out (>0.5s). Resetting pending flag.")
                 self.is_goal_pending = False
             else:
                 return
 
         target_tf = self.get_target_tf()
-        if target_tf is None: 
-            return
+        if target_tf is None: return
 
         t_x = target_tf.transform.translation.x
         t_y = target_tf.transform.translation.y

@@ -28,11 +28,11 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'kill_pose = tracker.kill_pose:main',
-            'goal_sender = tracker.goal_sender:main',
-            'chaser_calculator = tracker.chase_calculator:main',
-            'evasion_calculator = tracker.evasion_calculator:main',
-            'state_machine = tracker.state_machine:main',
+            'kill_pose = tracker_TEAM_11.kill_pose:main',
+            'goal_sender = tracker_TEAM_11.goal_sender:main',
+            'chaser_calculator = tracker_TEAM_11.chase_calculator:main',
+            'evasion_calculator = tracker_TEAM_11.evasion_calculator:main',
+            'state_machine = tracker_TEAM_11.state_machine:main',
         ],
     },
 )
