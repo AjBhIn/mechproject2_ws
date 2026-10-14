@@ -1,0 +1,30 @@
+digraph G {
+"enemy_bot/odom" -> "enemy_bot/base_footprint"[label=" Broadcaster: default_authority\nAverage rate: 50.199\nBuffer length: 5.02\nMost recent transform: 213.86\nOldest transform: 208.84\n"];
+"map" -> "enemy_bot/odom"[label=" Broadcaster: default_authority\nAverage rate: 5.208\nBuffer length: 4.8\nMost recent transform: 214.8\nOldest transform: 210.0\n"];
+"enemy_bot/base_footprint" -> "enemy_bot/base_link"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
+"enemy_bot/base_link" -> "enemy_bot/camera_link"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
+"enemy_bot/camera_link" -> "enemy_bot/camera_rgb_frame"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
+"enemy_bot/camera_rgb_frame" -> "enemy_bot/camera_rgb_optical_frame"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
+"enemy_bot/base_link" -> "enemy_bot/caster_back_link"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
+"enemy_bot/base_link" -> "enemy_bot/imu_link"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
+"enemy_bot/base_link" -> "enemy_bot/base_scan"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
+"our_bot/odom" -> "our_bot/base_footprint"[label=" Broadcaster: default_authority\nAverage rate: 50.199\nBuffer length: 5.02\nMost recent transform: 213.86\nOldest transform: 208.84\n"];
+"map" -> "our_bot/odom"[label=" Broadcaster: default_authority\nAverage rate: 5.208\nBuffer length: 4.8\nMost recent transform: 214.8\nOldest transform: 210.0\n"];
+"our_bot/base_footprint" -> "our_bot/base_link"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
+"our_bot/base_link" -> "our_bot/camera_link"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
+"our_bot/camera_link" -> "our_bot/camera_rgb_frame"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
+"our_bot/camera_rgb_frame" -> "our_bot/camera_rgb_optical_frame"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
+"our_bot/base_link" -> "our_bot/caster_back_link"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
+"our_bot/base_link" -> "our_bot/imu_link"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
+"our_bot/base_link" -> "our_bot/base_scan"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
+"our_bot/base_link" -> "our_bot/wheel_left_link"[label=" Broadcaster: default_authority\nAverage rate: 20.2\nBuffer length: 5.0\nMost recent transform: 213.85\nOldest transform: 208.85\n"];
+"our_bot/base_link" -> "our_bot/wheel_right_link"[label=" Broadcaster: default_authority\nAverage rate: 20.2\nBuffer length: 5.0\nMost recent transform: 213.85\nOldest transform: 208.85\n"];
+"enemy_bot/base_link" -> "enemy_bot/wheel_left_link"[label=" Broadcaster: default_authority\nAverage rate: 20.2\nBuffer length: 5.0\nMost recent transform: 213.85\nOldest transform: 208.85\n"];
+"enemy_bot/base_link" -> "enemy_bot/wheel_right_link"[label=" Broadcaster: default_authority\nAverage rate: 20.2\nBuffer length: 5.0\nMost recent transform: 213.85\nOldest transform: 208.85\n"];
+"enemy_bot/base_link" -> "enemy_bot/target_point"[label=" Broadcaster: default_authority\nAverage rate: 30.199\nBuffer length: 4.967\nMost recent transform: 213.834\nOldest transform: 208.867\n"];
+"map" -> "chase_nav_target"[label=" Broadcaster: default_authority\nAverage rate: 10.204\nBuffer length: 4.9\nMost recent transform: 213.8\nOldest transform: 208.9\n"];
+edge [style=invis];
+ subgraph cluster_legend { style=bold; color=black; label ="view_frames Result";
+"Recorded at time: 1791942670.9221137"[ shape=plaintext ] ;
+}->"map";
+}
