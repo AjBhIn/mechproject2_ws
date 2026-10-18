@@ -7,11 +7,33 @@ from nav_msgs.msg import OccupancyGrid
 import tf2_ros
 from geometry_msgs.msg import TransformStamped
 
+# --- GLOBAL TUNING VARIABLES ---
+LOOP_RATE_SEC = 0.033
+
+COSTMAP_MARGIN_CELLS = 6        
+MAX_SAFE_COST = 220              
+
+CAPTURE_ORIENT_DIST = 0.35      
+MIN_YAW_UPDATE_DIST = 0.15      
+FLANK_ENGAGE_DIST = 1.8         
+
+# --- TACTICAL LEASH & OVERSHOOT VARIABLES ---
+# Approach leash during CHASING
+CHASE_LEASH_DIST = 0.8          
+
+# VECTOR OVERSHOOT: During STRIKING, project the goal 1.0m BEHIND the enemy.
+# This tricks Nav2 into driving at full speed THROUGH the enemy's inflation layer,
+# allowing the robot to cross the 0.50m capture threshold before Nav2 can brake!
+STRIKE_OVERSHOOT_DIST = 1.0     
+
+FLANK_CONE_DEG = 60.0           
+FLANK_OFFSET_DIST = 1.5         
+MAX_YAW_RATE_SMOOTHING = 1.0    
+
 class ChaserCalculator(Node):
     def __init__(self):
         super().__init__('chaser_calculator')
 
-        # Dynamic namespace configuration
         raw_ns = self.get_namespace().strip('/')
         default_robot_ns = raw_ns if raw_ns else 'our_bot'
 
@@ -25,8 +47,8 @@ class ChaserCalculator(Node):
 
         self.robot_ns = self.get_parameter('chaser').value.strip('/')
         self.enemy_ns = self.get_parameter('enemy').value.strip('/')
-
         self.map_frame = self.get_parameter('map_frame').value
+        
         pursuer_p = self.get_parameter('pursuer_frame').value
         self.pursuer_frame = pursuer_p if pursuer_p else (f'{self.robot_ns}/base_link' if self.robot_ns else 'base_link')
 
@@ -35,25 +57,21 @@ class ChaserCalculator(Node):
 
         carrot_p = self.get_parameter('carrot_frame').value
         self.carrot_frame = carrot_p if carrot_p else (f'{self.enemy_ns}/target_point' if self.enemy_ns else 'target_point')
-
         self.broadcast_frame = self.get_parameter('broadcast_frame').value
-
-        # TUNING POINT: Intermediate goal projection horizon
-        self.short_goal_dist = 0.8
-        self.capture_orientation_dist = 0.35
 
         self.current_state = 'CHASING'
         self.costmap = None
         self.last_valid_yaw = 0.0
 
-        # ENHANCEMENT: Enemy heading and rotation tracking to prevent charging into front spins
         self.last_enemy_yaw = None
         self.last_enemy_time = None
         self.enemy_yaw_rate = 0.0
-
-        # ENHANCEMENT: Target TF smoothing to prevent target teleportation on 180-deg spins
         self.filtered_target_x = None
         self.filtered_target_y = None
+
+        self.flank_active_logged = False
+        self.dive_active_logged = False
+        self.was_sleeping = False  
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
@@ -62,12 +80,11 @@ class ChaserCalculator(Node):
         state_topic = f'/{self.robot_ns}/robot_state' if self.robot_ns else '/robot_state'
         costmap_topic = f'/{self.robot_ns}/global_costmap/costmap' if self.robot_ns else '/global_costmap/costmap'
 
-        # TIMER
         self.create_subscription(String, state_topic, self.state_cb, 10)
         self.create_subscription(OccupancyGrid, costmap_topic, self.costmap_cb, 10)
 
-        self.timer = self.create_timer(0.1, self.control_loop)
-        self.get_logger().info("Smart Chaser Calculator initialized (Flank Routing & Spin Guard Active).")
+        self.timer = self.create_timer(LOOP_RATE_SEC, self.control_loop)
+        self.get_logger().info("[CHASER CALCULATOR] Initialized. Vector Overshoot Active for Inflation Bypass!")
 
     def state_cb(self, msg):
         self.current_state = msg.data
@@ -80,36 +97,44 @@ class ChaserCalculator(Node):
         cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         return math.atan2(siny_cosp, cosy_cosp)
 
-    def is_pose_safe(self, x: float, y: float, max_cost: int = 50) -> bool:
+    def is_pose_safe(self, x: float, y: float, max_cost: int = MAX_SAFE_COST) -> bool:
         if self.costmap is None: return True
         info = self.costmap.info
         gx = int((x - info.origin.position.x) / info.resolution)
         gy = int((y - info.origin.position.y) / info.resolution)
 
-        # MAP BOUNDARY GUARD: Enforce a 15-cell margin (0.75m) from map edges
-        MARGIN = 15
-        if gx < MARGIN or gx >= (info.width - MARGIN) or \
-           gy < MARGIN or gy >= (info.height - MARGIN):
+        if gx < COSTMAP_MARGIN_CELLS or gx >= (info.width - COSTMAP_MARGIN_CELLS) or \
+           gy < COSTMAP_MARGIN_CELLS or gy >= (info.height - COSTMAP_MARGIN_CELLS):
             return False
 
         cost = self.costmap.data[gy * info.width + gx]
         return 0 <= cost < max_cost
 
-    def project_to_free_space(self, start_x: float, start_y: float, target_x: float, target_y: float):
-        if self.is_pose_safe(target_x, target_y, max_cost=50):
+    def project_to_free_space(self, target_x: float, target_y: float, p_x: float, p_y: float):
+        if self.is_pose_safe(target_x, target_y, max_cost=MAX_SAFE_COST):
             return target_x, target_y
 
-        dist = math.hypot(target_x - start_x, target_y - start_y)
-        if dist < 0.05: return start_x, start_y
+        best_tx, best_ty = target_x, target_y
+        min_dist_to_pursuer = float('inf')
+        found_safe = False
 
-        for i in range(1, 20):
-            alpha = 1.0 - (i / 20.0)
-            px = start_x + alpha * (target_x - start_x)
-            py = start_y + alpha * (target_y - start_y)
-            if self.is_pose_safe(px, py, max_cost=50):
-                return px, py
-
-        return start_x, start_y
+        for r in [0.15, 0.3, 0.45, 0.6]:
+            for angle in range(0, 360, 45):
+                rad = math.radians(angle)
+                tx = target_x + r * math.cos(rad)
+                ty = target_y + r * math.sin(rad)
+                
+                if self.is_pose_safe(tx, ty, max_cost=MAX_SAFE_COST):
+                    d_to_p = math.hypot(tx - p_x, ty - p_y)
+                    if d_to_p < min_dist_to_pursuer:
+                        min_dist_to_pursuer = d_to_p
+                        best_tx, best_ty = tx, ty
+                        found_safe = True
+            
+            if found_safe:
+                return best_tx, best_ty
+                
+        return target_x, target_y
 
     def update_enemy_yaw_rate(self, enemy_yaw: float, current_time: float):
         if self.last_enemy_yaw is not None and self.last_enemy_time is not None:
@@ -121,10 +146,22 @@ class ChaserCalculator(Node):
         self.last_enemy_time = current_time
 
     def control_loop(self):
-        if self.current_state != 'CHASING':
+        offensive_states = ['CHASING', 'STRIKING', 'COOLDOWN']
+        
+        if self.current_state not in offensive_states:
+            if not self.was_sleeping:
+                self.get_logger().info(f"[CHASER CALCULATOR] Yielding to Evasion Node.")
+                self.was_sleeping = True
+                
             self.filtered_target_x = None
             self.filtered_target_y = None
+            self.flank_active_logged = False
+            self.dive_active_logged = False
             return
+
+        if self.was_sleeping:
+            self.get_logger().info("[CHASER CALCULATOR] Resuming offensive pursuit.")
+            self.was_sleeping = False
 
         try:
             t_our = self.tf_buffer.lookup_transform(self.map_frame, self.pursuer_frame, rclpy.time.Time())
@@ -143,11 +180,10 @@ class ChaserCalculator(Node):
         now_sec = self.get_clock().now().nanoseconds / 1e9
         self.update_enemy_yaw_rate(enemy_yaw, now_sec)
 
-        # ENHANCEMENT 1: Filter target TF movements on sharp enemy turns to stop target teleportation
         if self.filtered_target_x is None:
             self.filtered_target_x, self.filtered_target_y = c_x, c_y
         else:
-            alpha = 0.4 if self.enemy_yaw_rate > 1.0 else 0.8  # Smooth target jumping when enemy spins fast
+            alpha = 0.4 if self.enemy_yaw_rate > MAX_YAW_RATE_SMOOTHING else 0.8  
             self.filtered_target_x = alpha * c_x + (1.0 - alpha) * self.filtered_target_x
             self.filtered_target_y = alpha * c_y + (1.0 - alpha) * self.filtered_target_y
 
@@ -155,40 +191,73 @@ class ChaserCalculator(Node):
         dy = self.filtered_target_y - p_y
         dist = math.hypot(dx, dy)
 
-        # ENHANCEMENT 2: Anti-Ramming Flank Routing
-        # Check if straight pursuit path cuts through enemy's front nose cone
         angle_to_pursuer_from_enemy = math.atan2(p_y - e_y, p_x - e_x)
         front_cone_diff = abs(math.atan2(math.sin(angle_to_pursuer_from_enemy - enemy_yaw), math.cos(angle_to_pursuer_from_enemy - enemy_yaw)))
 
-        # If enemy turned to face us (< 60 deg) and is close (< 1.8m), deflect carrot point sideways to flank!
-        if front_cone_diff < math.radians(60.0) and dist < 1.8:
+        tactical_x, tactical_y = 0.0, 0.0
+
+        # RULE 1: Anti-Ramming Dodge
+        if front_cone_diff < math.radians(FLANK_CONE_DEG) and dist < FLANK_ENGAGE_DIST:
+            if not self.flank_active_logged:
+                self.get_logger().warn(f"[CHASER CALCULATOR] Anti-Ramming! Flanking {FLANK_OFFSET_DIST}m around enemy front.")
+                self.flank_active_logged = True
+            self.dive_active_logged = False
+                
             flank_side = (angle_to_pursuer_from_enemy - enemy_yaw) > 0
             flank_offset_angle = enemy_yaw + (math.pi / 2.0 if flank_side else -math.pi / 2.0)
-            target_x = e_x + 1.0 * math.cos(flank_offset_angle)
-            target_y = e_y + 1.0 * math.sin(flank_offset_angle)
+            tactical_x = e_x + FLANK_OFFSET_DIST * math.cos(flank_offset_angle)
+            tactical_y = e_y + FLANK_OFFSET_DIST * math.sin(flank_offset_angle)
+            
         else:
-            # Standard linear lead pursuit
-            lead_dist = min(self.short_goal_dist, max(0.4, dist * 0.7))
-            if dist > lead_dist:
-                ratio = lead_dist / dist
-                target_x = p_x + dx * ratio
-                target_y = p_y + dy * ratio
+            self.flank_active_logged = False
+            
+            # RULE 2: Strike Dive (VECTOR OVERSHOOT)
+            if self.current_state == 'STRIKING':
+                if not self.dive_active_logged:
+                    self.get_logger().info(f"[CHASER CALCULATOR] STRIKING! Projecting goal {STRIKE_OVERSHOOT_DIST}m OVERSHOOT behind enemy to force full-speed penetration through inflation layer!")
+                    self.dive_active_logged = True
+                
+                # Project the goal 1.0m BEHIND the enemy along the approach line.
+                # Nav2 sees a clear goal beyond the inflation zone and maintains velocity.
+                approach_angle = math.atan2(e_y - p_x, e_x - p_x)
+                tactical_x = e_x + (STRIKE_OVERSHOOT_DIST * math.cos(enemy_yaw))
+                tactical_y = e_y + (STRIKE_OVERSHOOT_DIST * math.sin(enemy_yaw))
+                
+            # RULE 3: Approach Phase
             else:
-                target_x = self.filtered_target_x
-                target_y = self.filtered_target_y
+                self.dive_active_logged = False
+                tactical_x = self.filtered_target_x
+                tactical_y = self.filtered_target_y
 
-        # Prevent 180-degree move_yaw flips on micro-overshoots
-        if dist > 0.15:
+        target_x, target_y = 0.0, 0.0
+
+        if self.current_state == 'STRIKING':
+            # Drop leash during strike: Goal is set far behind enemy to maintain drive speed
+            target_x = tactical_x
+            target_y = tactical_y
+        else:
+            # Apply 0.8m leash during approach
+            dist_to_tactical = math.hypot(tactical_x - p_x, tactical_y - p_y)
+            angle_to_tactical = math.atan2(tactical_y - p_y, tactical_x - p_x)
+            
+            if dist_to_tactical > CHASE_LEASH_DIST:
+                target_x = p_x + (CHASE_LEASH_DIST * math.cos(angle_to_tactical))
+                target_y = p_y + (CHASE_LEASH_DIST * math.sin(angle_to_tactical))
+            else:
+                target_x = tactical_x
+                target_y = tactical_y
+
+        if dist > MIN_YAW_UPDATE_DIST:
             self.last_valid_yaw = math.atan2(dy, dx)
 
-        if dist <= self.capture_orientation_dist:
+        if dist <= CAPTURE_ORIENT_DIST:
             rot_z = c_rot.z
             rot_w = c_rot.w
         else:
             rot_z = math.sin(self.last_valid_yaw / 2.0)
             rot_w = math.cos(self.last_valid_yaw / 2.0)
 
-        safe_x, safe_y = self.project_to_free_space(p_x, p_y, target_x, target_y)
+        safe_x, safe_y = self.project_to_free_space(target_x, target_y, p_x, p_y)
 
         t = TransformStamped()
         t.header.stamp = self.get_clock().now().to_msg()

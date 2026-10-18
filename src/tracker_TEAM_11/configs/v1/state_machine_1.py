@@ -5,11 +5,36 @@ from rclpy.node import Node
 from std_msgs.msg import String
 import tf2_ros
 
+# --- GLOBAL TUNING VARIABLES ---
+# Loop rate for the state machine (30Hz)
+CONTROL_LOOP_RATE_SEC = 0.033
+
+# Evasion distance thresholds (shrunk for tight physical environments)
+BASE_DANGER_THRESHOLD_FRONT = 1.2  # Was 2.6m; distance to trigger evasion if enemy is facing us
+BASE_DANGER_THRESHOLD_REAR = 0.8   # Was 1.5m; distance to trigger evasion if enemy is facing away
+
+# Approach speed thresholds for predictive evasion (m/s)
+FAST_APPROACH_SPEED = 0.2
+FAST_RETREAT_SPEED = -0.2
+MAX_PREDICTIVE_BUFFER = 0.8
+
+# Angular hysteresis to prevent flickering between states when behind the enemy (degrees)
+HYSTERESIS_ANGLE_HIGH = 120.0
+HYSTERESIS_ANGLE_LOW = 110.0
+
+# Timeouts and durations (Relaxed for physical WiFi/Hardware latency)
+MIN_STATE_DURATION_SEC = 0.5       # Minimum time to hold a state before switching back
+TF_TIMEOUT_SEC = 2.5               # Was 2.0s; Dead man's switch timeout if TF data is lost over WiFi
+
 class StateMachine(Node):
+    """
+    Velocity-Aware State Machine. Determines if the robot should be CHASING or EVADING 
+    based on distance, relative angle, and the enemy's approach speed.
+    """
     def __init__(self):
         super().__init__('state_machine')
 
-        # --- Dynamic Namespace Configuration ---
+        # --- Dynamic Namespace Setup ---
         raw_ns = self.get_namespace().strip('/')
         default_robot_ns = raw_ns if raw_ns else 'our_bot'
 
@@ -29,84 +54,73 @@ class StateMachine(Node):
 
         self.state = 'CHASING'
 
-        # --- TF2 Setup ---
+        # --- TF2 & Subscriptions ---
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         state_topic = f'/{self.robot_ns}/robot_state' if self.robot_ns else '/robot_state'
         self.state_pub = self.create_publisher(String, state_topic, 10)
 
-        # --- State Timers & Variables ---
-        self.min_state_duration = 0.5  # Slightly reduced for faster switching
+        # --- Timing & Velocity Tracking ---
         self.last_state_change_time = None
         self.last_tf_success_time = None
-        self.tf_timeout_duration = 2.0 
         
         self.tactical_override_active = False
-
-        # --- SMART: Velocity Tracking Variables ---
         self.last_enemy_dist = None
         self.last_eval_time = None
 
-        # --- FAST: 30Hz Control Loop ---
-        # Upgraded from 0.1 (10Hz) to 0.033 (30Hz) for lightning-fast state transitions
-        self.timer = self.create_timer(0.033, self.control_loop)
-        self.get_logger().info("Smart State Machine Initialized (30Hz, Predictive Threat Active).")
+        # Overclocked control loop for rapid response
+        self.timer = self.create_timer(CONTROL_LOOP_RATE_SEC, self.control_loop)
+        self.get_logger().info("Smart State Machine Initialized. Physical Bot Thresholds Active.")
 
     def get_pursuer_in_enemy_frame(self):
+        """Looks up the pursuer's position relative to the enemy's coordinate frame."""
         try:
             trans = self.tf_buffer.lookup_transform(
-                self.enemy_frame, self.pursuer_frame, 
-                rclpy.time.Time()
+                self.enemy_frame, self.pursuer_frame, rclpy.time.Time()
             )
             return trans.transform.translation.x, trans.transform.translation.y
         except tf2_ros.TransformException:
             return None, None
 
     def evaluate_threat_state(self, rel_x: float, rel_y: float, dt: float):
-        """
-        Determines danger based on distance, relative angle, AND the rate of closure.
-        """
+        """Calculates danger using distance, angle, and approach velocity."""
         distance = math.hypot(rel_x, rel_y)
         relative_angle_deg = abs(math.degrees(math.atan2(rel_y, rel_x)))
 
-        # 1. Base Threshold (Static Profile)
+        # Base Thresholds based on angle (Interpolation between front and rear danger zones)
         if relative_angle_deg <= 90.0:
             ratio = relative_angle_deg / 90.0
-            base_threshold = 2.6 - (1.1 * ratio)
+            base_threshold = BASE_DANGER_THRESHOLD_FRONT - ((BASE_DANGER_THRESHOLD_FRONT - BASE_DANGER_THRESHOLD_REAR) * ratio)
         else:
             ratio = (relative_angle_deg - 90.0) / 90.0
-            base_threshold = 1.5 - (1.5 * ratio)
+            base_threshold = BASE_DANGER_THRESHOLD_REAR - (BASE_DANGER_THRESHOLD_REAR * ratio)
 
-        # 2. SMART: Predictive Velocity Expansion
-        # Calculate how fast the distance between bots is changing (m/s)
+        self.get_logger().info(f"Enemy {distance} and angle {relative_angle_deg}")
+
+        # Predictive Velocity Expansion
         approach_speed = 0.0
         if self.last_enemy_dist is not None and dt > 0.0:
-            # Positive speed means they are getting closer; negative means moving away
             approach_speed = (self.last_enemy_dist - distance) / dt
-        
         self.last_enemy_dist = distance
 
-        # 3. Dynamic Threshold Adjustment
         current_threshold = base_threshold
-        if approach_speed > 0.2:
-            # Enemy is charging: Expand the danger zone predictively (up to 0.8m extra)
-            # This triggers the evasion earlier if the enemy is fast.
-            predictive_buffer = min(0.8, approach_speed * 0.5) 
+        # If enemy is charging fast, expand the danger zone early
+        if approach_speed > FAST_APPROACH_SPEED:
+            predictive_buffer = min(MAX_PREDICTIVE_BUFFER, approach_speed * 0.5) 
             current_threshold += predictive_buffer
-        elif approach_speed < -0.2:
-            # Enemy is retreating: Shrink the danger zone slightly to resume chasing faster
+            self.get_logger().debug(f"Enemy charging at {approach_speed:.2f}m/s. Expanding threshold to {current_threshold:.2f}m")
+        
+        # If enemy is retreating, shrink danger zone so we resume chasing faster
+        elif approach_speed < FAST_RETREAT_SPEED:
             current_threshold -= 0.2
 
-        if distance > current_threshold:
-            return False, distance, current_threshold
-            
-        return True, distance, current_threshold
+        return distance <= current_threshold, distance, current_threshold
 
     def control_loop(self):
         now = self.get_clock().now()
         
-        # Initialize timing variables on first run
+        # Initialization block
         if self.last_state_change_time is None:
             self.last_state_change_time = now
             self.last_tf_success_time = now
@@ -119,16 +133,13 @@ class StateMachine(Node):
 
         rel_x, rel_y = self.get_pursuer_in_enemy_frame()
         
-        # Dead Man's Switch: Sensor Loss Handling
+        # Dead Man's Switch: Revert to chasing if sensor/TF is lost over WiFi
         if rel_x is None: 
-            time_since_last_tf = current_time_sec - (self.last_tf_success_time.nanoseconds / 1e9)
-            
-            if time_since_last_tf > self.tf_timeout_duration and self.state != 'CHASING':
-                self.get_logger().warn(f'Enemy tracking lost for {time_since_last_tf:.1f}s. Reverting to CHASING.')
+            if current_time_sec - (self.last_tf_success_time.nanoseconds / 1e9) > TF_TIMEOUT_SEC and self.state != 'CHASING':
+                self.get_logger().warn(f"TF Data lost for >{TF_TIMEOUT_SEC}s. Reverting to CHASING for safety.")
                 self.state = 'CHASING'
                 self.last_state_change_time = now
-                self.last_enemy_dist = None  # Reset velocity tracker
-            
+                self.last_enemy_dist = None  
             msg = String()
             msg.data = self.state
             self.state_pub.publish(msg)
@@ -136,38 +147,33 @@ class StateMachine(Node):
 
         self.last_tf_success_time = now
 
-        # Evaluate threat using distance, angle, and time delta (dt) for velocity
         in_danger, dist, threshold = self.evaluate_threat_state(rel_x, rel_y, dt)
 
-        # --- STATE TRANSITION LOGIC ---
+        # State Transition Logic
         if self.state == 'CHASING':
             if in_danger:
-                self.get_logger().warn(f'DANGER ZONE! Dist: {dist:.2f}m <= {threshold:.2f}m. EVADING.')
+                self.get_logger().warn(f'DANGER ZONE ENTRY! Dist: {dist:.2f}m <= {threshold:.2f}m. Switching to EVADING.')
                 self.state = 'EVADING'
                 self.last_state_change_time = now
 
         elif self.state == 'EVADING':
             rel_angle_deg = abs(math.degrees(math.atan2(rel_y, rel_x)))
             
-            # Angular Hysteresis for Tactical Override
-            if rel_angle_deg > 120.0:
+            # Angular Hysteresis: Hold state if we are still maneuvering behind the enemy
+            if rel_angle_deg > HYSTERESIS_ANGLE_HIGH:
                 self.tactical_override_active = True
-            elif rel_angle_deg < 110.0:
+            elif rel_angle_deg < HYSTERESIS_ANGLE_LOW:
                 self.tactical_override_active = False
             
-            # Clearance requires stepping 0.2m outside the dynamic threshold
             clear_of_threat = not in_danger and dist > (threshold + 0.2)
-            timer_met = time_in_state >= self.min_state_duration
+            timer_met = time_in_state >= MIN_STATE_DURATION_SEC
             
-            # Exit evasion if we are clear AND (we waited long enough OR secured the enemy's rear)
             if clear_of_threat and (timer_met or self.tactical_override_active):
-                reason = "Rear Advantage" if self.tactical_override_active else "Timer Met"
-                self.get_logger().info(f'Clear of threat ({reason}). Resuming CHASING.')
+                self.get_logger().info(f'Clear of threat (Dist: {dist:.2f}m). Resuming CHASING.')
                 self.state = 'CHASING'
                 self.last_state_change_time = now
                 self.tactical_override_active = False
 
-        # Broadcast State
         msg = String()
         msg.data = self.state
         self.state_pub.publish(msg)

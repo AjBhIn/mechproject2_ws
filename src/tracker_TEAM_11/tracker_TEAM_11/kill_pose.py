@@ -1,14 +1,26 @@
+# kill_pose_2.py
 #!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
 import tf2_ros
 from geometry_msgs.msg import TransformStamped
 
+# --- GLOBAL TUNING VARIABLES ---
+# Reduced from 1.0m to 0.45m to keep the target clear of massive 0.35m costmap inflation zones.
+DEFAULT_DISTANCE_BEHIND = 0.45 
+# TF broadcast rate (~30Hz) for smooth, high-fidelity target tracking
+BROADCAST_RATE_SEC = 1.0 / 30.0 
+
 class TargetPointBroadcaster(Node):
+    """
+    Broadcasts the theoretical 'Carrot' or capture target point relative to the enemy robot.
+    Places a continuous TF frame exactly behind the enemy's rear axis, optimized to 
+    remain within strike distance but outside of lethal inflation ranges.
+    """
     def __init__(self):
         super().__init__('target_point_broadcaster')
 
-        # Dynamic namespace configuration
+        # --- Dynamic Namespace Configuration ---
         raw_ns = self.get_namespace().strip('/')
         default_enemy_ns = raw_ns if raw_ns else 'enemy_bot'
 
@@ -20,17 +32,16 @@ class TargetPointBroadcaster(Node):
 
         self.declare_parameter('parent_frame', default_parent)
         self.declare_parameter('child_frame', default_child)
-        
-        # TUNING POINT: How far directly behind the enemy the target point sits.
-        # If your bot crashes into the back of the enemy, increase this. If it stops too early, decrease it.
-        self.declare_parameter('distance_behind', 1.0)
+        self.declare_parameter('distance_behind', DEFAULT_DISTANCE_BEHIND)
 
         self.parent_frame = self.get_parameter('parent_frame').value
         self.child_frame = self.get_parameter('child_frame').value
         self.distance_behind = self.get_parameter('distance_behind').value
 
+        # --- TF2 Broadcaster & Timer ---
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
-        self.timer = self.create_timer(1.0 / 30.0, self.broadcast_target_frame)
+        self.timer = self.create_timer(BROADCAST_RATE_SEC, self.broadcast_target_frame)
+        self.get_logger().info(f"[KILL POSE] Initialized. Broadcasting target {self.distance_behind}m behind enemy.")
 
     def broadcast_target_frame(self):
         t = TransformStamped()
@@ -39,10 +50,12 @@ class TargetPointBroadcaster(Node):
         t.header.frame_id = self.parent_frame
         t.child_frame_id = self.child_frame
 
-        # orientation of the tf
+        # Position the target point directly behind the enemy on its local X-axis
         t.transform.translation.x = -float(self.distance_behind)
         t.transform.translation.y = 0.0
         t.transform.translation.z = 0.0
+        
+        # Align orientation perfectly parallel with the enemy's heading
         t.transform.rotation.w = 1.0
 
         self.tf_broadcaster.sendTransform(t)

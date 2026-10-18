@@ -11,6 +11,9 @@ def generate_launch_description():
     
     declare_use_sim_time_cmd = DeclareLaunchArgument(
         'use_sim_time',
+        # -------------------------------
+        # CHANGE THIS FOR PHYSICAL BOT TO FALSE
+        #--------------------------------
         default_value='true',
         description='Use simulation (Gazebo) clock if true, hardware clock if false'
     )

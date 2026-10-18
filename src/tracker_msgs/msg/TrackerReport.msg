@@ -1,3 +1,5 @@
+std_msgs/Header header
+
 # The opponent's photo
 sensor_msgs/CompressedImage image
 

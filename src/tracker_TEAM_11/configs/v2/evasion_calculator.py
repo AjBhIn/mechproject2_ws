@@ -6,15 +6,39 @@ import tf2_ros
 from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import OccupancyGrid
 from std_msgs.msg import String
-from typing import List, Tuple
 import numpy as np
 
+# --- GLOBAL TUNING VARIABLES ---
+LOOP_RATE_SEC = 0.033
+
+# Costmap & Map Boundaries
+COSTMAP_MARGIN_CELLS = 6        # Was 15; reduced to allow fleeing closer to arena edges
+MAX_SAFE_COST = 75              # Was 40; increased so bot can squeeze through inflated crate gaps
+MAX_EMERGENCY_COST = 89         # Absolute maximum cost allowed before hitting a lethal obstacle (100)
+
+# Evasion Trigger Distances
+CLOSE_THREAT_DIST = 1.2         # Distance at which weights heavily shift to prioritize pure escape speed
+MIN_UPDATE_DIST = 0.02          # Minimum distance target must move to justify sending a new TF
+
+# Network Timeouts
+TF_TIMEOUT_SEC = 2.5            # Was 0.5s; relaxed for physical WiFi latency
+LOG_THROTTLE_SEC = 1.0          # How often to print warnings (prevents console spam)
+
+# Base Scoring Weights for Path Selection
+WEIGHT_DIST = 12.0
+WEIGHT_SPEED = 2.0
+WEIGHT_TURN = 3.0
+WEIGHT_COST = 0.5
 
 class EvasionCalculator(Node):
+    """
+    High-Performance Evasion node. Uses vectorized NumPy arrays to evaluate 144 escape paths 
+    instantly, sorts them by safety/tactics, and only runs expensive raycasting on the Top 10.
+    """
     def __init__(self):
         super().__init__('evasion_calculator')
 
-        # --- Dynamic Namespace Configuration ---
+        # --- Dynamic Namespace ---
         raw_ns = self.get_namespace().strip('/')
         default_robot_ns = raw_ns if raw_ns else 'our_bot'
 
@@ -34,24 +58,23 @@ class EvasionCalculator(Node):
 
         enemy_p = self.get_parameter('enemy_frame').value
         self.enemy_frame = enemy_p if enemy_p else (f'{self.enemy_ns}/base_link' if self.enemy_ns else 'base_link')
-
         self.target_frame = self.get_parameter('target_frame').value
         
-        # --- TF2 Subsystem ---
+        # --- TF2 & Subscriptions ---
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
 
         self.current_state = 'CHASING'
-
-        # --- Subscriptions ---
+        
         state_topic = f'/{self.robot_ns}/robot_state' if self.robot_ns else '/robot_state'
         costmap_topic = f'/{self.robot_ns}/global_costmap/costmap' if self.robot_ns else '/global_costmap/costmap'
 
         self.state_sub = self.create_subscription(String, state_topic, self.state_cb, 10)
         self.costmap_sub = self.create_subscription(OccupancyGrid, costmap_topic, self.costmap_callback, 10)
 
-        # --- Vectorized Candidate Grid (Precomputed for Speed) ---
+        # --- Vectorized Candidate Grid (Precomputed for speed) ---
+        # 4 radii * 36 angles = 144 candidate points evaluated simultaneously
         self.sample_radii = np.array([0.6, 1.0, 1.5, 2.0])
         angles = np.deg2rad(np.arange(0, 360, 10))
         r_grid, a_grid = np.meshgrid(self.sample_radii, angles)
@@ -60,32 +83,26 @@ class EvasionCalculator(Node):
         self.cand_dy = (r_grid * np.sin(a_grid)).flatten()
         self.cand_r = r_grid.flatten()
 
-        # --- Map & State Variables ---
+        # --- Map Variables & Hysteresis ---
         self.map_data = None
         self.map_res = 0.05
-        self.map_width = 0
-        self.map_height = 0
-        self.map_origin_x = 0.0 
-        self.map_origin_y = 0.0
-        
-        self.MAX_SAFE_COST = 40
-        self.MIN_UPDATE_DIST = 0.02
+        self.map_width = self.map_height = 0
+        self.map_origin_x = self.map_origin_y = 0.0 
         
         self.last_target_x, self.last_target_y = None, None
         self.active_target_x, self.active_target_y = None, None
+        
         self.slide_direction_bias = None 
-        self.last_chosen_angle = None  # NEW: Tracks directional momentum
+        self.last_chosen_angle = None 
 
-        # --- Logging Throttles ---
         self.last_log_time = 0.0
+        self.last_tf_time = 0.0 
 
-        # --- Control Loop ---
-        self.timer = self.create_timer(0.1, self.control_loop)
-        self.get_logger().info("EvasionCalculator initialized. Awaiting EVADING state.")
+        # 30Hz Control Loop
+        self.timer = self.create_timer(LOOP_RATE_SEC, self.control_loop)
+        self.get_logger().info("Ultra-Fast Robust EvasionCalculator initialized (Physical Map Limits).")
 
     def state_cb(self, msg):
-        if self.current_state != msg.data:
-            self.get_logger().info(f"State transitioned from {self.current_state} to {msg.data}")
         self.current_state = msg.data
 
     def get_yaw_from_quaternion(self, q):
@@ -96,51 +113,46 @@ class EvasionCalculator(Node):
     def costmap_callback(self, msg: OccupancyGrid):
         self.map_data = np.array(msg.data, dtype=np.int16)
         self.map_res = msg.info.resolution
-        self.map_width = msg.info.width
-        self.map_height = msg.info.height
-        self.map_origin_x = msg.info.origin.position.x
-        self.map_origin_y = msg.info.origin.position.y
+        self.map_width, self.map_height = msg.info.width, msg.info.height
+        self.map_origin_x, self.map_origin_y = msg.info.origin.position.x, msg.info.origin.position.y
 
     def get_cell_cost(self, x: float, y: float) -> int:
+        """Fetch cost of a single point (used for robot's current position)"""
         if self.map_data is None: return 100
         raw_col = int((x - self.map_origin_x) / self.map_res)
         raw_row = int((y - self.map_origin_y) / self.map_res)
 
-        MARGIN = 15
-        if raw_col < MARGIN or raw_col >= (self.map_width - MARGIN) or \
-           raw_row < MARGIN or raw_row >= (self.map_height - MARGIN):
+        if raw_col < COSTMAP_MARGIN_CELLS or raw_col >= (self.map_width - COSTMAP_MARGIN_CELLS) or \
+           raw_row < COSTMAP_MARGIN_CELLS or raw_row >= (self.map_height - COSTMAP_MARGIN_CELLS):
             return 100
 
         col = max(0, min(raw_col, self.map_width - 1))
         row = max(0, min(raw_row, self.map_height - 1))
-
         cost = self.map_data[row * self.map_width + col]
         return 100 if cost == -1 else cost
 
     def get_cell_costs_vectorized(self, xs: np.ndarray, ys: np.ndarray) -> np.ndarray:
+        """Fetch costs for ALL 144 candidate points in one C-optimized step"""
         if self.map_data is None: return np.full(xs.shape, 100)
         
         raw_cols = ((xs - self.map_origin_x) / self.map_res).astype(np.int32)
         raw_rows = ((ys - self.map_origin_y) / self.map_res).astype(np.int32)
         
-        MARGIN = 15
-        invalid = (raw_cols < MARGIN) | (raw_cols >= (self.map_width - MARGIN)) | \
-                  (raw_rows < MARGIN) | (raw_rows >= (self.map_height - MARGIN))
+        invalid = (raw_cols < COSTMAP_MARGIN_CELLS) | (raw_cols >= (self.map_width - COSTMAP_MARGIN_CELLS)) | \
+                  (raw_rows < COSTMAP_MARGIN_CELLS) | (raw_rows >= (self.map_height - COSTMAP_MARGIN_CELLS))
                   
         cols = np.clip(raw_cols, 0, self.map_width - 1)
         rows = np.clip(raw_rows, 0, self.map_height - 1)
         
         costs = self.map_data[rows * self.map_width + cols]
         costs = np.where((costs == -1) | invalid, 100, costs)
-        
         return costs
 
     def is_path_clear(self, start_x: float, start_y: float, end_x: float, end_y: float, max_cost: int) -> bool:
+        """Raycasts a single line to ensure no obstacles exist between robot and goal"""
         if self.map_data is None: return False
         dist = math.hypot(end_x - start_x, end_y - start_y)
-        
-        if dist < 0.05:
-            return self.get_cell_cost(end_x, end_y) <= max_cost
+        if dist < 0.05: return self.get_cell_cost(end_x, end_y) <= max_cost
 
         step_size = 0.10 if dist <= 0.8 else 0.05
         steps = max(2, int(dist / step_size))
@@ -152,29 +164,24 @@ class EvasionCalculator(Node):
         raw_cols = ((px - self.map_origin_x) / self.map_res).astype(np.int32)
         raw_rows = ((py - self.map_origin_y) / self.map_res).astype(np.int32)
 
-        MARGIN = 15
-        if np.any(raw_cols < MARGIN) or np.any(raw_cols >= (self.map_width - MARGIN)) or \
-           np.any(raw_rows < MARGIN) or np.any(raw_rows >= (self.map_height - MARGIN)):
+        if np.any(raw_cols < COSTMAP_MARGIN_CELLS) or np.any(raw_cols >= (self.map_width - COSTMAP_MARGIN_CELLS)) or \
+           np.any(raw_rows < COSTMAP_MARGIN_CELLS) or np.any(raw_rows >= (self.map_height - COSTMAP_MARGIN_CELLS)):
             return False
 
         cols = np.clip(raw_cols, 0, self.map_width - 1)
         rows = np.clip(raw_rows, 0, self.map_height - 1)
-
         indices = rows * self.map_width + cols
         costs = self.map_data[indices]
 
-        if np.any(costs > max_cost) or np.any(costs == -1): 
-            return False
-            
-        return True
+        return not (np.any(costs > max_cost) or np.any(costs == -1))
 
     def check_path_feasibility(self, start_x, start_y, end_x, end_y, max_cost):
+        """Checks direct paths first, then falls back to 'dogleg' (V-shaped) paths if blocked"""
         if self.is_path_clear(start_x, start_y, end_x, end_y, max_cost):
             return True, 'STRAIGHT'
             
         direct_angle = math.atan2(end_y - start_y, end_x - start_x)
-        total_dist = math.hypot(end_x - start_x, end_y - start_y)
-        mid_dist = total_dist / 2.0
+        mid_dist = math.hypot(end_x - start_x, end_y - start_y) / 2.0
         
         test_angles = np.deg2rad([30, -30, 45, -45, 60, -60, 90, -90])
         mid_x = start_x + (mid_dist * np.cos(direct_angle + test_angles))
@@ -184,81 +191,59 @@ class EvasionCalculator(Node):
             if self.is_path_clear(start_x, start_y, mid_x[i], mid_y[i], max_cost):
                 if self.is_path_clear(mid_x[i], mid_y[i], end_x, end_y, max_cost):
                     return True, 'DOGLEG'
-                    
         return False, 'NONE'
 
     def get_adaptive_weights(self, current_cost, dist_to_enemy):
-        w_dist, w_speed, w_turn, w_cost = 12.0, 2.0, 3.0, 0.5
-        bad_cost = 20
-        min_dist_to_enemy = 1.2
+        """Dynamically adjust evasion weights based on map danger and enemy proximity."""
+        w_dist, w_speed, w_turn, w_cost = WEIGHT_DIST, WEIGHT_SPEED, WEIGHT_TURN, WEIGHT_COST
         
-        if current_cost > bad_cost: 
+        if current_cost > 20: 
             w_cost, w_turn = 1.5, 0.5
-        if dist_to_enemy < min_dist_to_enemy: 
+        if dist_to_enemy < CLOSE_THREAT_DIST: 
+            # Panic mode: heavily prioritize pure distance away from the enemy
             w_dist, w_speed = 22.0, 4.0
             
         return {'w_dist': w_dist, 'w_speed': w_speed, 'w_turn': w_turn, 'w_cost': w_cost}
 
-    def get_safe_escape_points(self, robot_x, robot_y):
-        cand_x = robot_x + self.cand_dx
-        cand_y = robot_y + self.cand_dy
+    def evaluate_and_select_best_escape(self, our_x, our_y, our_yaw, enemy_x, enemy_y, enemy_yaw):
+        """
+        The core of the evasion calculator. Scores all valid points based on distance to enemy,
+        front cone penalties, directional momentum, and wall repulsion. 
+        Only runs raycasts on the Top 10 to save CPU.
+        """
+        c_x = our_x + self.cand_dx
+        c_y = our_y + self.cand_dy
+        c_r = self.cand_r
         
-        costs = self.get_cell_costs_vectorized(cand_x, cand_y)
-        current_cost = self.get_cell_cost(robot_x, robot_y)
-        
-        effective_max_cost = min(89, max(self.MAX_SAFE_COST, current_cost))
-        valid_mask = costs <= effective_max_cost
-        
-        valid_x = cand_x[valid_mask]
-        valid_y = cand_y[valid_mask]
-        valid_r = self.cand_r[valid_mask]
-        valid_costs = costs[valid_mask]
-        
-        safe_points = []
-        for i in range(len(valid_x)):
-            is_clear, path_type = self.check_path_feasibility(
-                robot_x, robot_y, valid_x[i], valid_y[i], effective_max_cost
-            )
-            if is_clear:
-                safe_points.append((valid_x[i], valid_y[i], valid_r[i], valid_costs[i], path_type))
-                
-        return safe_points
-
-    def get_best_escape_target(self, safe_points, our_x, our_y, our_yaw, enemy_x, enemy_y, enemy_yaw):
-        if not safe_points: 
-            return None
-
+        c_cost = self.get_cell_costs_vectorized(c_x, c_y)
         current_cost = self.get_cell_cost(our_x, our_y)
+        
+        # Robustness: Cap dynamic threshold so paths are never projected through solid walls
+        effective_max_cost = min(MAX_EMERGENCY_COST, max(MAX_SAFE_COST, current_cost))
+        
+        valid_mask = c_cost <= effective_max_cost
+        if not np.any(valid_mask): return None, -1000.0
+            
+        c_x, c_y, c_r, c_cost = c_x[valid_mask], c_y[valid_mask], c_r[valid_mask], c_cost[valid_mask]
+        cand_angle = np.arctan2(c_y - our_y, c_x - our_x)
+
         weights = self.get_adaptive_weights(current_cost, math.hypot(our_x - enemy_x, our_y - enemy_y))
+        dist_to_enemy = np.hypot(c_x - enemy_x, c_y - enemy_y)
+        scores = (dist_to_enemy * weights['w_dist']) + (c_r * weights['w_speed'])
 
         away_dx = our_x - enemy_x
         away_dy = our_y - enemy_y
         away_angle = math.atan2(away_dy, away_dx)
-
-        direct_away_x = our_x + 1.0 * math.cos(away_angle)
-        direct_away_y = our_y + 1.0 * math.sin(away_angle)
-        direct_away_blocked = self.get_cell_cost(direct_away_x, direct_away_y) > 20
-
+        
+        direct_away_blocked = self.get_cell_cost(our_x + math.cos(away_angle), our_y + math.sin(away_angle)) > 20
         tangent_left = away_angle + (math.pi / 2.0)
         tangent_right = away_angle - (math.pi / 2.0)
 
-        c_x = np.array([p[0] for p in safe_points])
-        c_y = np.array([p[1] for p in safe_points])
-        c_r = np.array([p[2] for p in safe_points])
-        c_cost = np.array([p[3] for p in safe_points])
-        c_is_straight = np.array([1.0 if p[4] == 'STRAIGHT' else 0.0 for p in safe_points])
-
-        dist_to_enemy = np.hypot(c_x - enemy_x, c_y - enemy_y)
-        scores = (dist_to_enemy * weights['w_dist']) + (c_r * weights['w_speed'])
-
-        cand_angle = np.arctan2(c_y - our_y, c_x - our_x)
-
+        # Slide logic if direct retreat is blocked
         if direct_away_blocked:
             diff_left = np.abs(np.arctan2(np.sin(cand_angle - tangent_left), np.cos(cand_angle - tangent_left)))
             diff_right = np.abs(np.arctan2(np.sin(cand_angle - tangent_right), np.cos(cand_angle - tangent_right)))
-            
-            slide_score = (np.pi - np.minimum(diff_left, diff_right)) * 12.0
-            scores += slide_score
+            scores += (np.pi - np.minimum(diff_left, diff_right)) * 12.0
 
             if self.slide_direction_bias == 'LEFT':
                 scores = np.where(diff_left < diff_right, scores + 20.0, scores)
@@ -268,56 +253,64 @@ class EvasionCalculator(Node):
             angle_diff_away = np.abs(np.arctan2(np.sin(cand_angle - away_angle), np.cos(cand_angle - away_angle)))
             scores += (np.pi - angle_diff_away) * 10.0
 
-        # --- Front Cone & Decreasing Distance Penalty ---
+        # Front Cone Penalty: Don't dive across the enemy's nose
         angle_from_enemy_to_cand = np.arctan2(c_y - enemy_y, c_x - enemy_x)
         front_diff = np.abs(np.arctan2(np.sin(angle_from_enemy_to_cand - enemy_yaw), np.cos(angle_from_enemy_to_cand - enemy_yaw)))
-        
         in_front_view = front_diff < np.deg2rad(60.0)
-        current_dist_to_enemy = math.hypot(our_x - enemy_x, our_y - enemy_y)
-        getting_closer = dist_to_enemy < current_dist_to_enemy
-        
+        getting_closer = dist_to_enemy < math.hypot(our_x - enemy_x, our_y - enemy_y)
         scores = np.where(in_front_view & getting_closer, scores - 50.0, scores)
 
-        # --- NEW: Directional Momentum (Anti-Zigzag) ---
-        # Force the robot to commit to the escape direction it chose on the previous tick
+        # Momentum: Stick to the current escape path to stop zigzagging
         if self.last_chosen_angle is not None:
             angle_diff_from_last = np.abs(np.arctan2(np.sin(cand_angle - self.last_chosen_angle), np.cos(cand_angle - self.last_chosen_angle)))
             scores -= (angle_diff_from_last * 25.0)
 
-        # --- Costmap Penalties ---
+        # Wall Repulsion Magnet: Aggressively seek open space if currently touching a wall
         cost_increase = c_cost - current_cost
         scores = np.where(cost_increase > 0, scores - (cost_increase * 3.5), scores)
         scores = np.where(c_cost > 20, scores - (c_cost * 2.5), scores)
+        
+        if current_cost > 10:
+            cost_decrease = current_cost - c_cost
+            scores = np.where(cost_decrease > 0, scores + (cost_decrease * 4.0), scores)
+        scores = np.where(c_cost == 0, scores + 35.0, scores)
 
         turn_penalty = np.abs(np.arctan2(np.sin(cand_angle - our_yaw), np.cos(cand_angle - our_yaw)))
         scores -= turn_penalty * weights['w_turn']
         scores -= c_cost * weights['w_cost']
 
-        scores += c_is_straight * 15.0
-        scores = np.where((c_cost >= 0) & (c_cost < 10), scores + 10.0, scores)
-
-        # --- UPDATED: Stronger Target Hysteresis Lock ---
-        # Widened the radius and increased the bonus to stop the robot from changing its mind
         if self.active_target_x is not None and self.active_target_y is not None:
             active_dists = np.hypot(c_x - self.active_target_x, c_y - self.active_target_y)
             scores = np.where(active_dists < 0.7, scores + 40.0, scores)
 
-        # Resolve Best
-        best_idx = np.argmax(scores)
-        best_point = (c_x[best_idx], c_y[best_idx], cand_angle[best_idx])
-        
-        self.active_target_x, self.active_target_y = best_point[0], best_point[1]
-        
-        chosen_angle = best_point[2]
-        self.last_chosen_angle = chosen_angle  # Store the chosen angle for momentum next tick
-        
-        dl = abs(math.atan2(math.sin(chosen_angle - tangent_left), math.cos(chosen_angle - tangent_left)))
-        dr = abs(math.atan2(math.sin(chosen_angle - tangent_right), math.cos(chosen_angle - tangent_right)))
-        self.slide_direction_bias = 'LEFT' if dl < dr else 'RIGHT'
+        # TOP-K RAYCAST OPTIMIZATION
+        top_k = min(10, len(scores))
+        top_indices = np.argsort(scores)[-top_k:][::-1]
 
-        return best_point
+        best_point = None
+        best_score = -float('inf')
+
+        for idx in top_indices:
+            tx, ty, t_angle, t_base_score = c_x[idx], c_y[idx], cand_angle[idx], scores[idx]
+            
+            is_clear, path_type = self.check_path_feasibility(our_x, our_y, tx, ty, effective_max_cost)
+            if is_clear:
+                final_score = t_base_score + (15.0 if path_type == 'STRAIGHT' else 0.0)
+                if final_score > best_score:
+                    best_score = final_score
+                    best_point = (tx, ty, t_angle)
+
+        if best_point is not None:
+            self.active_target_x, self.active_target_y = best_point[0], best_point[1]
+            self.last_chosen_angle = best_point[2]
+            dl = abs(math.atan2(math.sin(best_point[2] - tangent_left), math.cos(best_point[2] - tangent_left)))
+            dr = abs(math.atan2(math.sin(best_point[2] - tangent_right), math.cos(best_point[2] - tangent_right)))
+            self.slide_direction_bias = 'LEFT' if dl < dr else 'RIGHT'
+            
+        return best_point, best_score
 
     def execute_emergency_escape(self, global_x: float, global_y: float, enemy_x: float, enemy_y: float):
+        """Star-pattern fallback that ignores raycasting and just tries to slide down the cost gradient"""
         em_radii = np.array([0.3, 0.6, 0.9])
         angles = np.deg2rad(np.arange(0, 360, 15)) 
         
@@ -326,92 +319,79 @@ class EvasionCalculator(Node):
         cand_y = global_y + (r_grid * np.sin(a_grid)).flatten()
         
         costs = self.get_cell_costs_vectorized(cand_x, cand_y)
-        
-        valid_mask = costs < 90
+        valid_mask = costs < MAX_EMERGENCY_COST
 
         if np.any(valid_mask):
-            valid_x = cand_x[valid_mask]
-            valid_y = cand_y[valid_mask]
-            valid_costs = costs[valid_mask]
-            
+            valid_x, valid_y, valid_costs = cand_x[valid_mask], cand_y[valid_mask], costs[valid_mask]
             dist_to_enemy = np.hypot(valid_x - enemy_x, valid_y - enemy_y)
-            
+            # Maximize distance, heavily minimize cost
             scores = (dist_to_enemy * 25.0) - (valid_costs * 1.5)
             
             best_idx = np.argmax(scores)
-            best_x = valid_x[best_idx]
-            best_y = valid_y[best_idx]
+            best_x, best_y = valid_x[best_idx], valid_y[best_idx]
             best_yaw = math.atan2(best_y - global_y, best_x - global_x)
-            
             return best_x, best_y, best_yaw
 
-        dx = global_x - enemy_x
-        dy = global_y - enemy_y
+        # Absolute worst case: drive straight away from enemy
+        dx, dy = global_x - enemy_x, global_y - enemy_y
         escape_yaw = math.atan2(dy, dx) if math.hypot(dx, dy) > 0.01 else 0.0
-        
         return global_x, global_y, escape_yaw
 
     def control_loop(self):
-        if self.map_data is None:
-            return
+        now = self.get_clock().now().nanoseconds / 1e9
 
-        # Reset momentum and target locks if we are no longer evading
+        if self.map_data is None: return
+
         if self.current_state != 'EVADING':
-            self.last_target_x = None
-            self.last_target_y = None
-            self.active_target_x = None
-            self.active_target_y = None
-            self.slide_direction_bias = None
-            self.last_chosen_angle = None
+            self.last_target_x, self.last_target_y = None, None
+            self.active_target_x, self.active_target_y = None, None
+            self.slide_direction_bias, self.last_chosen_angle = None, None
             return
 
         try:
-            tf_global = self.tf_buffer.lookup_transform(
-                self.map_frame, self.robot_frame, rclpy.time.Time()
-            )
-            tf_enemy_global = self.tf_buffer.lookup_transform(
-                self.map_frame, self.enemy_frame, rclpy.time.Time()
-            )
-        except tf2_ros.TransformException as ex:
-            self.get_logger().debug(f"TF Lookup failed: {ex}")
+            tf_global = self.tf_buffer.lookup_transform(self.map_frame, self.robot_frame, rclpy.time.Time())
+            tf_enemy_global = self.tf_buffer.lookup_transform(self.map_frame, self.enemy_frame, rclpy.time.Time())
+            self.last_tf_time = now
+        except tf2_ros.TransformException:
+            # Dead Man's Switch: Hold position if sensors fail (relaxed for WiFi)
+            if now - self.last_tf_time > TF_TIMEOUT_SEC:
+                if now - self.last_log_time > LOG_THROTTLE_SEC:
+                    self.get_logger().warn(f"TF Data lost for >{TF_TIMEOUT_SEC}s! Evasion halted to prevent runway.")
+                    self.last_log_time = now
+                if self.last_target_x is not None:
+                    t = TransformStamped()
+                    t.header.stamp = self.get_clock().now().to_msg()
+                    t.header.frame_id = self.map_frame
+                    t.child_frame_id = self.target_frame
+                    t.transform.translation.x = self.last_target_x
+                    t.transform.translation.y = self.last_target_y
+                    t.transform.rotation.w = 1.0
+                    self.tf_broadcaster.sendTransform(t)
             return
 
         global_x, global_y = tf_global.transform.translation.x, tf_global.transform.translation.y
         our_yaw = self.get_yaw_from_quaternion(tf_global.transform.rotation)
-        
-        enemy_global_x = tf_enemy_global.transform.translation.x
-        enemy_global_y = tf_enemy_global.transform.translation.y
+        enemy_global_x, enemy_global_y = tf_enemy_global.transform.translation.x, tf_enemy_global.transform.translation.y
         enemy_global_yaw = self.get_yaw_from_quaternion(tf_enemy_global.transform.rotation)
 
-        now = self.get_clock().now().nanoseconds / 1e9
+        best_target, max_score = self.evaluate_and_select_best_escape(
+            global_x, global_y, our_yaw, enemy_global_x, enemy_global_y, enemy_global_yaw
+        )
 
-        safe_points = self.get_safe_escape_points(global_x, global_y)
-        
-        if not safe_points:
-            if now - self.last_log_time > 1.0:
-                self.get_logger().warn("No safe standard paths found! Executing EMERGENCY ESCAPE.")
+        # Trigger Emergency if standard paths are blocked OR if scores are deeply negative (wall corner)
+        if best_target is None or max_score < -25.0:
+            if now - self.last_log_time > LOG_THROTTLE_SEC:
+                self.get_logger().warn(f"Standard evasion paths blocked! Score: {max_score:.1f}. Triggering EMERGENCY ESCAPE.")
                 self.last_log_time = now
             target_x, target_y, target_yaw = self.execute_emergency_escape(global_x, global_y, enemy_global_x, enemy_global_y)
         else:
-            if now - self.last_log_time > 1.0:
-                self.get_logger().info(f"Evaluated {len(safe_points)} safe candidate paths.")
-                self.last_log_time = now
-            
-            best_target = self.get_best_escape_target(
-                safe_points, global_x, global_y, our_yaw, 
-                enemy_global_x, enemy_global_y, enemy_global_yaw
-            )
-            if best_target is None: 
-                return
             target_x, target_y, target_yaw = best_target
 
         if self.last_target_x is not None and self.last_target_y is not None:
             alpha = 0.5
             target_x = alpha * target_x + (1.0 - alpha) * self.last_target_x
             target_y = alpha * target_y + (1.0 - alpha) * self.last_target_y
-
-        if self.last_target_x is not None: 
-            if math.hypot(target_x - self.last_target_x, target_y - self.last_target_y) < self.MIN_UPDATE_DIST: 
+            if math.hypot(target_x - self.last_target_x, target_y - self.last_target_y) < MIN_UPDATE_DIST: 
                 return        
         
         self.last_target_x, self.last_target_y = target_x, target_y
@@ -423,7 +403,6 @@ class EvasionCalculator(Node):
         t.transform.translation.x, t.transform.translation.y, t.transform.translation.z = target_x, target_y, 0.0
         t.transform.rotation.z, t.transform.rotation.w = math.sin(target_yaw / 2.0), math.cos(target_yaw / 2.0)
         self.tf_broadcaster.sendTransform(t)
-
 
 def main(args=None):
     rclpy.init(args=args)
