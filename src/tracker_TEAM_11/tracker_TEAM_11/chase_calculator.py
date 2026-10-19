@@ -17,7 +17,9 @@ MAX_EMERGENCY_COST = 95
 STUCK_ESCAPE_DIST = 1.2         
 
 CAPTURE_ORIENT_DIST = 0.35      
-MIN_YAW_UPDATE_DIST = 0.15      
+MIN_YAW_UPDATE_DIST = 0.15
+DIST_STEPS = [0.2, 0.4, 0.6, 0.8]
+STUCK_DIST_STEPS = [1.2, 1.0, 0.8, 0.6]      
 
 CHASE_LEASH_DIST = 0.8          
 STRIKE_TARGET_DIST = 0.10       
@@ -34,6 +36,7 @@ class ChaserCalculator(Node):
     def __init__(self):
         super().__init__('chaser_calculator')
 
+        # Dynamic Namespace
         raw_ns = self.get_namespace().strip('/')
         default_robot_ns = raw_ns if raw_ns else 'our_bot'
 
@@ -79,12 +82,23 @@ class ChaserCalculator(Node):
         self.filtered_target_x = None
         self.filtered_target_y = None
 
+        # [OPTIMIZED]: Pre-computed target-centric arc offsets for fast pathing around obstacles
+        arc_radii = np.array(DIST_STEPS)
+        arc_angles = np.deg2rad(np.arange(0, 360, 30))
+        r_grid, a_grid = np.meshgrid(arc_radii, arc_angles)
+        self.arc_dx = (r_grid * np.cos(a_grid)).flatten()
+        self.arc_dy = (r_grid * np.sin(a_grid)).flatten()
+        self.arc_r = r_grid.flatten() # Pre-cached distance from candidate to true target
+
         self.flank_active_logged = False
         self.dive_active_logged = False
         self.was_sleeping = False  
         self.last_log_time = 0.0
+        self.flank_direction_bias = 1.0
+        self.flank_lock_time = 0.0
         
         self.is_recovering = False
+        self.high_cost_start_time = None
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
@@ -151,6 +165,7 @@ class ChaserCalculator(Node):
         if self.costmap is None: return True
         return self.get_cell_cost(x, y) <= max_cost
 
+    # Recovery method when the bot is stuck in inflated zone.
     def get_chaser_stuck_recovery_target(self, our_x: float, our_y: float, our_yaw: float, 
                                          enemy_x: float, enemy_y: float, carrot_x: float, carrot_y: float, 
                                          current_cost: int, should_log: bool):
@@ -189,7 +204,7 @@ class ChaserCalculator(Node):
         best_escape_yaw = float(self.probe_angles[best_idx])
 
         escape_dist = 0.6 
-        for d in (1.2, 1.0, 0.8, 0.6):
+        for d in STUCK_DIST_STEPS:
             tx = our_x + d * math.cos(best_escape_yaw)
             ty = our_y + d * math.sin(best_escape_yaw)
             if self.get_cell_cost(tx, ty) < MAX_SAFE_COST and math.hypot(tx - enemy_x, ty - enemy_y) >= 0.45:
@@ -230,37 +245,49 @@ class ChaserCalculator(Node):
         if self.current_state == 'STRIKING':
             return target_x, target_y
 
+        # 1. Try the direct straight-line path first
         trunc_x, trunc_y = self.truncate_to_line_of_sight(p_x, p_y, target_x, target_y)
-        
-        if math.hypot(trunc_x - target_x, trunc_y - target_y) < 0.05:
+        if ((trunc_x - target_x)**2 + (trunc_y - target_y)**2) < 0.0025:
             return target_x, target_y
 
-        best_tx, best_ty = trunc_x, trunc_y
-        best_score = float('inf')
+        # 2. Direct path blocked. Use vectorized candidate generation around the target.
+        txs = target_x + self.arc_dx
+        tys = target_y + self.arc_dy
 
-        for r in [0.2, 0.4, 0.6, 0.8]:
-            for angle in range(0, 360, 30):
-                rad = math.radians(angle)
-                tx = target_x + r * math.cos(rad)
-                ty = target_y + r * math.sin(rad)
+        # 3. Calculate angles from robot to all candidates simultaneously
+        angles_from_robot = np.arctan2(tys - p_y, txs - p_x)
+        
+        # 4. Prune backward-facing paths instantly (must stay offensive)
+        turn_diffs = np.abs((angles_from_robot - our_yaw + np.pi) % (2 * np.pi) - np.pi)
+        valid_mask = turn_diffs <= 1.745 # 100 degrees
+        
+        if not np.any(valid_mask):
+            return trunc_x, trunc_y # Fallback to truncated straight line if all arcs are behind us
+            
+        v_txs = txs[valid_mask]
+        v_tys = tys[valid_mask]
+        v_r = self.arc_r[valid_mask]
+
+        # 5. Score valid candidates using fast NumPy arrays
+        dist_to_robot = np.hypot(v_txs - p_x, v_tys - p_y)
+        scores = v_r + (dist_to_robot * 0.2)
+        
+        # Sort indices by best score (lowest is best)
+        sorted_indices = np.argsort(scores)
+        
+        # 6. Raycast only the best paths. Stop immediately once a clear path is found!
+        for idx in sorted_indices:
+            cand_x = float(v_txs[idx])
+            cand_y = float(v_tys[idx])
+            
+            arc_trunc_x, arc_trunc_y = self.truncate_to_line_of_sight(p_x, p_y, cand_x, cand_y)
+            
+            # If the raycast reaches the candidate point without hitting a wall, take it and exit!
+            if ((arc_trunc_x - cand_x)**2 + (arc_trunc_y - cand_y)**2) < 0.0025:
+                return cand_x, cand_y
                 
-                angle_from_robot = math.atan2(ty - p_y, tx - p_x)
-                turn_diff = abs(math.atan2(math.sin(angle_from_robot - our_yaw), math.cos(angle_from_robot - our_yaw)))
-                
-                if turn_diff > math.radians(100.0):
-                    continue
-                
-                arc_trunc_x, arc_trunc_y = self.truncate_to_line_of_sight(p_x, p_y, tx, ty)
-                if math.hypot(arc_trunc_x - tx, arc_trunc_y - ty) < 0.05:
-                    d_to_target = math.hypot(tx - target_x, ty - target_y)
-                    d_to_robot = math.hypot(tx - p_x, ty - p_y)
-                    score = d_to_target + (d_to_robot * 0.2)
-                    
-                    if score < best_score:
-                        best_score = score
-                        best_tx, best_ty = tx, ty
-                        
-        return best_tx, best_ty
+        # If all arcs are physically blocked by the costmap, return the safest straight-line truncation
+        return trunc_x, trunc_y
 
     def update_enemy_yaw_rate(self, enemy_yaw: float, current_time: float):
         if self.last_enemy_yaw is not None and self.last_enemy_time is not None:
@@ -312,6 +339,7 @@ class ChaserCalculator(Node):
         if self.filtered_target_x is None:
             self.filtered_target_x, self.filtered_target_y = c_x, c_y
         else:
+            # Alpha value works as smoother when steep angle chosen
             alpha = 0.4 if self.enemy_yaw_rate > MAX_YAW_RATE_SMOOTHING else 0.8  
             self.filtered_target_x = alpha * c_x + (1.0 - alpha) * self.filtered_target_x
             self.filtered_target_y = alpha * c_y + (1.0 - alpha) * self.filtered_target_y
@@ -322,14 +350,20 @@ class ChaserCalculator(Node):
 
         tactical_x, tactical_y = 0.0, 0.0
 
-        if abs_front_diff < math.radians(120.0):
+        # This here is to avoid robot even when in chasing
+        if abs_front_diff < 2.094:
             if not self.flank_active_logged:
                 self.get_logger().warn(f"[CHASER CALCULATOR] Orbiting {ORBITAL_FLANK_DIST}m around to the rear pocket!")
                 self.flank_active_logged = True
             self.dive_active_logged = False
             
-            direction_sign = 1.0 if rel_angle_from_front >= 0.0 else -1.0
-            orbit_angle = angle_to_pursuer_from_enemy + (direction_sign * math.radians(60.0))
+            # --- FLANK COMMITMENT LOCK ---
+            # Prevent the target from teleporting left/right if the enemy wiggles near 0.0 rad
+            if (now_sec - self.flank_lock_time) > 1.0:
+                self.flank_direction_bias = 1.0 if rel_angle_from_front >= 0.0 else -1.0
+                self.flank_lock_time = now_sec
+                
+            orbit_angle = angle_to_pursuer_from_enemy + (self.flank_direction_bias * 1.047)
             
             tactical_x = e_x + ORBITAL_FLANK_DIST * math.cos(orbit_angle)
             tactical_y = e_y + ORBITAL_FLANK_DIST * math.sin(orbit_angle)
@@ -381,29 +415,54 @@ class ChaserCalculator(Node):
             rot_z = math.sin(self.last_valid_yaw / 2.0)
             rot_w = math.cos(self.last_valid_yaw / 2.0)
 
+        # Finding a normal to move to 
         safe_x, safe_y = self.find_arc_path_to_target(target_x, target_y, p_x, p_y, our_yaw)
 
+
+        # --- DWB-AWARE STUCK DETECTION ---
+        # MAGICAL NUMBERS PRESENT HERE 
         current_cost = self.get_cell_cost(p_x, p_y)
-        front_x = p_x + 0.25 * math.cos(our_yaw)
-        front_y = p_y + 0.25 * math.sin(our_yaw)
+        
+        # [OPTIMIZED]: Retracted bumper projection to 0.15m to allow DWB to corner-cut smoothly
+        front_x = p_x + 0.15 * math.cos(our_yaw)
+        front_y = p_y + 0.15 * math.sin(our_yaw)
         front_cost = self.get_cell_cost(front_x, front_y)
 
-        dist_to_safe = math.hypot(safe_x - p_x, safe_y - p_y)
-        target_collapsed = (dist_to_safe < 0.25) and (dist_to_enemy > 0.60)
+        dist_to_safe_sq = (safe_x - p_x)**2 + (safe_y - p_y)**2
+        dist_to_enemy_sq = (e_x - p_x)**2 + (e_y - p_y)**2
         
+        target_collapsed = (dist_to_safe_sq < 0.0625) and (dist_to_enemy_sq > 0.36)
+        
+        # 1. Check if we are in lethal space or just corner-cutting
+        is_lethal = (current_cost >= MAX_EMERGENCY_COST) or (front_cost >= MAX_EMERGENCY_COST)
+        in_high_cost = (current_cost >= MAX_SAFE_COST) or (front_cost >= MAX_SAFE_COST)
+
+        # 2. Update the Corner-Cutting Timer
+        if in_high_cost:
+            if self.high_cost_start_time is None:
+                self.high_cost_start_time = now_sec
+        else:
+            self.high_cost_start_time = None
+
+        time_in_high_cost = (now_sec - self.high_cost_start_time) if self.high_cost_start_time else 0.0
+
+        # 3. Trigger Logic
         if not self.is_recovering:
-            if current_cost >= MAX_SAFE_COST or front_cost >= MAX_SAFE_COST or target_collapsed:
+            # Trigger instantly on Lethal/Collapsed, OR wait 0.4s for DWB to clear the corner
+            if is_lethal or target_collapsed or time_in_high_cost > 0.40:
                 self.is_recovering = True
         else:
-            if current_cost < 75 and front_cost < 75 and not target_collapsed:
+            # Release recovery once we are in completely clear space
+            if current_cost < (MAX_SAFE_COST - 10) and front_cost < (MAX_SAFE_COST - 10) and not target_collapsed:
                 self.is_recovering = False
+                self.high_cost_start_time = None
 
         is_stuck = self.is_recovering and (self.current_state == 'CHASING')
         should_log = (now_sec - self.last_log_time > LOG_THROTTLE_SEC)
 
         if is_stuck:
             if should_log:
-                reason = f"High Elevation (Center: {current_cost}, Bumper: {front_cost})" if (current_cost >= MAX_SAFE_COST or front_cost >= MAX_SAFE_COST) else "Path Collapsed (Blocked)"
+                reason = "Lethal Crash" if is_lethal else ("Timeout in High Cost" if in_high_cost else "Path Collapsed")
                 self.get_logger().warn(f"[CHASER TRIGGER] Stuck detected via {reason}. Firing Recovery!")
                 
             safe_x, safe_y, safe_yaw = self.get_chaser_stuck_recovery_target(

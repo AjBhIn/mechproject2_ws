@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+import math
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import String
+from geometry_msgs.msg import PoseStamped
+from nav2_msgs.action import NavigateToPose
+from rclpy.action import ActionClient
+from action_msgs.msg import GoalStatus
+from sensor_msgs.msg import CompressedImage
+import tf2_ros
+import sys
+
+# Import custom msg pkg
+try:
+    from tracker_msgs.msg import TrackerReport
+    HAS_TRACKER_MSGS = True
+except ImportError:
+    HAS_TRACKER_MSGS = False
+    print("\n[CRITICAL WARNING]: 'tracker_msgs' not found!\n", file=sys.stderr)
+
+# --- GLOBAL TUNING VARIABLES ---
+LOOP_RATE_SEC = 0.05
+ACTION_SERVER_TIMEOUT = 1.0       
+
+CAPTURE_DISTANCE_M = 0.50         
+CAPTURE_COOLDOWN_SEC = 4.8 # Set bit low to allow for mismatch between times       
+
+# High agility thresholds to force rapid trajectory updates
+MIN_GOAL_MOVE_DIST = 0.25         
+MIN_GOAL_YAW_CHANGE = math.radians(15.0)
+MIN_GOAL_TIME_ELAPSED = 0.40
+
+# Action server ghost protection
+MAX_PENDING_GOAL_SEC = 1.0
+
+class GoalSender(Node):
+    """
+    Acts as the bridge between custom dynamic target TFs (chase/evasion) and the Nav2 Action Server.
+    [OPTIMIZED]: Added asynchronous timeout fallback. Prevents freezing if the Nav2 action server drops packets.
+    """
+    def __init__(self):
+        super().__init__('goal_sender')
+
+        # Dynamic Namespace
+        raw_ns = self.get_namespace().strip('/')
+        default_robot_ns = raw_ns if raw_ns else 'our_bot'
+
+        self.declare_parameter('chaser', default_robot_ns)
+        self.declare_parameter('enemy', 'enemy_bot')
+        self.declare_parameter('map_frame', 'map')
+        self.declare_parameter('robot_frame', '')
+        self.declare_parameter('action_name', '')
+        self.declare_parameter('chase_frame', 'chase_nav_target')
+        self.declare_parameter('escape_frame', 'dynamic_nav_target')
+
+        self.robot_ns = self.get_parameter('chaser').value.strip('/')
+        self.enemy_ns = self.get_parameter('enemy').value.strip('/')
+        self.map_frame = self.get_parameter('map_frame').value
+        
+        robot_p = self.get_parameter('robot_frame').value
+        self.robot_frame = robot_p if robot_p else (f'{self.robot_ns}/base_link' if self.robot_ns else 'base_link')
+        self.enemy_frame = f'{self.enemy_ns}/base_link' if self.enemy_ns else 'base_link'
+
+        action_p = self.get_parameter('action_name').value
+        self.action_name = action_p if action_p else (f'/{self.robot_ns}/navigate_to_pose' if self.robot_ns else '/navigate_to_pose')
+
+        self.chase_frame = self.get_parameter('chase_frame').value
+        self.escape_frame = self.get_parameter('escape_frame').value
+
+        # Creating an id for the robot, used for tracker report
+        try:
+            self.my_id_val = int(self.robot_ns[-2:]) if len(self.robot_ns) > 2 else 1
+            self.opp_id_val = int(self.enemy_ns[-2:]) if len(self.enemy_ns) > 2 else 2
+        except ValueError:
+            self.my_id_val, self.opp_id_val = 1, 2
+
+        self.last_goal_time = 0.0
+        self.last_capture_time = 0.0
+        self.state = 'CHASING'
+        self.last_sent_pose = None
+        self.active_goal_handle = None
+        self.is_goal_pending = False
+        
+        self.force_update = False 
+
+        # Tracker Communication System
+        self.tracker_image = None
+        camera_topic = f'/{self.robot_ns}/oakd/rgb/preview/image_raw/compressed' if self.robot_ns else '/oakd/rgb/preview/image_raw/compressed'
+        self.image_sub = self.create_subscription(CompressedImage, camera_topic, self.image_callback, 10)
+
+        # Checking if our custom msg pkg have been imported
+        if HAS_TRACKER_MSGS:
+            report_topic = f'/{self.robot_ns}/tracker_report' if self.robot_ns else '/tracker_report'
+            self.report_pub = self.create_publisher(TrackerReport, report_topic, 10)
+
+            report_img_topic = f'/{self.robot_ns}/tracker_report_img/compressed' if self.robot_ns else '/tracker_report_img/compressed'
+            self.report_img_pub = self.create_publisher(CompressedImage, report_img_topic, 10)
+
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+
+        state_topic = f'/{self.robot_ns}/robot_state' if self.robot_ns else '/robot_state'
+        self.state_sub = self.create_subscription(String, state_topic, self.state_cb, 10)
+        
+        self.nav_client = ActionClient(self, NavigateToPose, self.action_name)
+        
+        self.timer = self.create_timer(LOOP_RATE_SEC, self.control_loop)
+        self.get_logger().info("[GOAL SENDER] High-Agility Throttling and Server Ghost Protection Active.")
+
+    def image_callback(self, msg):
+        self.tracker_image = msg
+
+    # Method for checking and updating our robot state
+    def state_cb(self, msg):
+        new_state = msg.data
+        if self.state != new_state:
+            self.get_logger().info(f"[GOAL SENDER] State shifted: {self.state} -> {new_state}. Forcing Preemption!")
+            self.force_update = True 
+            self.state = new_state
+            
+            # [OPTIMIZED]: Actively cancel the current Nav2 goal so the robot snaps instantly to the new state
+            if self.active_goal_handle:
+                self.active_goal_handle.cancel_goal_async()
+                self.active_goal_handle = None
+
+    def get_yaw_from_quaternion(self, q):
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        return math.atan2(siny_cosp, cosy_cosp)
+
+    def trigger_capture_report(self, rel_dist, rel_orient):
+        # Safety check to know we have tracker msg pkg and image to in memory
+        if not HAS_TRACKER_MSGS or self.tracker_image is None: return
+
+        # Activating cooldown
+        now_sec = self.get_clock().now().nanoseconds / 1e9
+        if (now_sec - self.last_capture_time) < CAPTURE_COOLDOWN_SEC:
+            return  
+
+        try:
+            report = TrackerReport()
+            report.header.stamp = self.get_clock().now().to_msg()
+            report.header.frame_id = str(self.map_frame)
+            
+            report.image.header = self.tracker_image.header
+            report.image.format = self.tracker_image.format
+            report.image.data = self.tracker_image.data
+            
+            report.my_id = self.my_id_val & 0xFF
+            report.opp_id = self.opp_id_val & 0xFF
+            report.rel_dist = float(rel_dist)
+            report.rel_orient = float(rel_orient)
+
+            self.report_pub.publish(report)
+            self.report_img_pub.publish(self.tracker_image)
+            self.last_capture_time = now_sec
+            self.get_logger().warn(f"[GOAL SENDER] >>> SCORE! Capture Report Published. Distance: {rel_dist:.2f}m <<<")
+                
+        except Exception as e:
+            self.get_logger().warn(f"[GOAL SENDER] Capture sequence failed: {e}")
+
+    # Sending the goal
+    def goal_response_callback(self, future):
+        self.is_goal_pending = False
+        try:
+            goal_handle = future.result()
+            if goal_handle.accepted:
+                self.active_goal_handle = goal_handle
+            else:
+                self.get_logger().warn("[GOAL SENDER] Local Planner REJECTED the goal. Waiting for new calculation.")
+                self.active_goal_handle = None
+        except Exception as e:
+            self.get_logger().error(f"[GOAL SENDER] Exception in goal response: {e}")
+            self.active_goal_handle = None
+
+    def control_loop(self):
+        if not self.nav_client.wait_for_server(timeout_sec=ACTION_SERVER_TIMEOUT): 
+            return
+
+        now_sec = self.get_clock().now().nanoseconds / 1e9
+
+        try:
+            rel_tf = self.tf_buffer.lookup_transform(
+                self.robot_frame, self.enemy_frame, rclpy.time.Time())
+            rel_dist = math.hypot(rel_tf.transform.translation.x, rel_tf.transform.translation.y)
+            if rel_dist <= CAPTURE_DISTANCE_M:
+                rel_orient = self.get_yaw_from_quaternion(rel_tf.transform.rotation)
+                self.trigger_capture_report(rel_dist, rel_orient)
+        except tf2_ros.TransformException:
+            pass
+
+        if self.force_update:
+            self.is_goal_pending = False
+
+        # [OPTIMIZED]: Action server ghosting fallback
+        if self.is_goal_pending: 
+            if (now_sec - self.last_goal_time) > MAX_PENDING_GOAL_SEC: 
+                self.get_logger().warn("[GOAL SENDER] Action Server timeout! Hard-clearing goal lock.")
+                self.is_goal_pending = False
+            else:
+                return
+
+        # Dynamic tf choose 
+        target_frame = self.escape_frame if self.state == 'EVADING' else self.chase_frame
+        try:
+            target_tf = self.tf_buffer.lookup_transform(
+                self.map_frame, target_frame, rclpy.time.Time())
+        except tf2_ros.TransformException:
+            return
+
+        t_x = target_tf.transform.translation.x
+        t_y = target_tf.transform.translation.y
+        t_rot = target_tf.transform.rotation
+
+        if not self.force_update and self.last_sent_pose is not None:
+            dist_moved = math.hypot(t_x - self.last_sent_pose.pose.position.x, t_y - self.last_sent_pose.pose.position.y)
+            time_elapsed = now_sec - self.last_goal_time
+
+            yaw_current = self.get_yaw_from_quaternion(t_rot)
+            yaw_last = self.get_yaw_from_quaternion(self.last_sent_pose.pose.orientation)
+            yaw_change = abs(math.atan2(math.sin(yaw_current - yaw_last), math.cos(yaw_current - yaw_last)))
+
+            if dist_moved < MIN_GOAL_MOVE_DIST and yaw_change < MIN_GOAL_YAW_CHANGE and time_elapsed < MIN_GOAL_TIME_ELAPSED:
+                return
+
+        self.force_update = False
+        self.get_logger().debug(f"[GOAL SENDER] Dispatching New Coordinate Vector to Nav2 -> Target: {target_frame}")
+
+        goal = PoseStamped()
+        goal.header.frame_id = self.map_frame
+        goal.header.stamp = self.get_clock().now().to_msg()
+        goal.pose.position.x = t_x
+        goal.pose.position.y = t_y
+        goal.pose.orientation = t_rot
+
+        goal_msg = NavigateToPose.Goal()
+        goal_msg.pose = goal
+
+        self.is_goal_pending = True
+        self.last_goal_time = now_sec
+        self.last_sent_pose = goal
+
+        # Using async method for continuous working
+        send_future = self.nav_client.send_goal_async(goal_msg)
+        send_future.add_done_callback(self.goal_response_callback)
+
+def main(args=None):
+    rclpy.init(args=args)
+    rclpy.spin(GoalSender())
+    rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
