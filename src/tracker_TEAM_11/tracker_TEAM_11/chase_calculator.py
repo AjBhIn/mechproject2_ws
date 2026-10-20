@@ -340,7 +340,7 @@ class ChaserCalculator(Node):
             self.filtered_target_x, self.filtered_target_y = c_x, c_y
         else:
             # Alpha value works as smoother when steep angle chosen
-            alpha = 0.4 if self.enemy_yaw_rate > MAX_YAW_RATE_SMOOTHING else 0.8  
+            alpha = 0.4 if self.enemy_yaw_rate > MAX_YAW_RATE_SMOOTHING else 0.8
             self.filtered_target_x = alpha * c_x + (1.0 - alpha) * self.filtered_target_x
             self.filtered_target_y = alpha * c_y + (1.0 - alpha) * self.filtered_target_y
 
@@ -415,12 +415,12 @@ class ChaserCalculator(Node):
             rot_z = math.sin(self.last_valid_yaw / 2.0)
             rot_w = math.cos(self.last_valid_yaw / 2.0)
 
-        # Finding a normal to move to 
+        # Finding a normal to move to
         safe_x, safe_y = self.find_arc_path_to_target(target_x, target_y, p_x, p_y, our_yaw)
 
 
         # --- DWB-AWARE STUCK DETECTION ---
-        # MAGICAL NUMBERS PRESENT HERE 
+        # MAGICAL NUMBERS PRESENT HERE
         current_cost = self.get_cell_cost(p_x, p_y)
         
         # [OPTIMIZED]: Retracted bumper projection to 0.15m to allow DWB to corner-cut smoothly
