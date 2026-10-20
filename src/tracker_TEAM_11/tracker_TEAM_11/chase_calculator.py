@@ -11,22 +11,22 @@ import numpy as np
 # --- GLOBAL TUNING VARIABLES ---
 LOOP_RATE_SEC = 0.033
 
-COSTMAP_MARGIN_CELLS = 6        
-MAX_SAFE_COST = 85              
-MAX_EMERGENCY_COST = 95         
-STUCK_ESCAPE_DIST = 1.2         
+COSTMAP_MARGIN_CELLS = 6
+MAX_SAFE_COST = 85
+MAX_EMERGENCY_COST = 95
+STUCK_ESCAPE_DIST = 1.2
 
-CAPTURE_ORIENT_DIST = 0.35      
+CAPTURE_ORIENT_DIST = 0.35
 MIN_YAW_UPDATE_DIST = 0.15
 DIST_STEPS = [0.2, 0.4, 0.6, 0.8]
-STUCK_DIST_STEPS = [1.2, 1.0, 0.8, 0.6]      
+STUCK_DIST_STEPS = [1.2, 1.0, 0.8, 0.6]
 
-CHASE_LEASH_DIST = 0.8          
-STRIKE_TARGET_DIST = 0.10       
-ORBITAL_FLANK_DIST = 1.2        
+CHASE_LEASH_DIST = 0.8
+STRIKE_TARGET_DIST = 0.10
+ORBITAL_FLANK_DIST = 1.2
 
-MAX_YAW_RATE_SMOOTHING = 1.0    
-LOG_THROTTLE_SEC = 1.0          
+MAX_YAW_RATE_SMOOTHING = 1.0
+LOG_THROTTLE_SEC = 1.0
 
 class ChaserCalculator(Node):
     """
@@ -92,7 +92,7 @@ class ChaserCalculator(Node):
 
         self.flank_active_logged = False
         self.dive_active_logged = False
-        self.was_sleeping = False  
+        self.was_sleeping = False
         self.last_log_time = 0.0
         self.flank_direction_bias = 1.0
         self.flank_lock_time = 0.0
@@ -166,8 +166,8 @@ class ChaserCalculator(Node):
         return self.get_cell_cost(x, y) <= max_cost
 
     # Recovery method when the bot is stuck in inflated zone.
-    def get_chaser_stuck_recovery_target(self, our_x: float, our_y: float, our_yaw: float, 
-                                         enemy_x: float, enemy_y: float, carrot_x: float, carrot_y: float, 
+    def get_chaser_stuck_recovery_target(self, our_x: float, our_y: float, our_yaw: float,
+                                         enemy_x: float, enemy_y: float, carrot_x: float, carrot_y: float,
                                          current_cost: int, should_log: bool):
         # [OPTIMIZED]: Uses pre-allocated self.probe_cos and self.probe_sin arrays
         probe_x = our_x + 0.6 * self.probe_cos
@@ -203,7 +203,7 @@ class ChaserCalculator(Node):
         best_idx = np.argmax(np.where(valid_angles, scores, -1e9))
         best_escape_yaw = float(self.probe_angles[best_idx])
 
-        escape_dist = 0.6 
+        escape_dist = 0.6
         for d in STUCK_DIST_STEPS:
             tx = our_x + d * math.cos(best_escape_yaw)
             ty = our_y + d * math.sin(best_escape_yaw)
