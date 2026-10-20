@@ -21,9 +21,9 @@ except ImportError:
 
 # --- GLOBAL TUNING VARIABLES ---
 LOOP_RATE_SEC = 0.05
-ACTION_SERVER_TIMEOUT = 1.0       
+ACTION_SERVER_TIMEOUT = 1.0
 
-CAPTURE_DISTANCE_M = 0.50         
+CAPTURE_DISTANCE_M = 0.50
 CAPTURE_COOLDOWN_SEC = 4.8 # Set bit low to allow for mismatch between times       
 
 # High agility thresholds to force rapid trajectory updates
@@ -82,7 +82,7 @@ class GoalSender(Node):
         self.active_goal_handle = None
         self.is_goal_pending = False
         
-        self.force_update = False 
+        self.force_update = False
 
         # Tracker Communication System
         self.tracker_image = None
@@ -116,7 +116,7 @@ class GoalSender(Node):
         new_state = msg.data
         if self.state != new_state:
             self.get_logger().info(f"[GOAL SENDER] State shifted: {self.state} -> {new_state}. Forcing Preemption!")
-            self.force_update = True 
+            self.force_update = True
             self.state = new_state
             
             # # [OPTIMIZED]: Actively cancel the current Nav2 goal so the robot snaps instantly to the new state
@@ -175,7 +175,7 @@ class GoalSender(Node):
             self.active_goal_handle = None
 
     def control_loop(self):
-        if not self.nav_client.wait_for_server(timeout_sec=ACTION_SERVER_TIMEOUT): 
+        if not self.nav_client.wait_for_server(timeout_sec=ACTION_SERVER_TIMEOUT):
             return
 
         now_sec = self.get_clock().now().nanoseconds / 1e9
@@ -194,14 +194,14 @@ class GoalSender(Node):
             self.is_goal_pending = False
 
         # [OPTIMIZED]: Action server ghosting fallback
-        if self.is_goal_pending: 
-            if (now_sec - self.last_goal_time) > MAX_PENDING_GOAL_SEC: 
+        if self.is_goal_pending:
+            if (now_sec - self.last_goal_time) > MAX_PENDING_GOAL_SEC:
                 self.get_logger().warn("[GOAL SENDER] Action Server timeout! Hard-clearing goal lock.")
                 self.is_goal_pending = False
             else:
                 return
 
-        # Dynamic tf choose 
+        # Dynamic tf choose
         target_frame = self.escape_frame if self.state == 'EVADING' else self.chase_frame
         try:
             target_tf = self.tf_buffer.lookup_transform(
